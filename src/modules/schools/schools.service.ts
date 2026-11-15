@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import AdmZip from 'adm-zip';
 import * as bcrypt from 'bcryptjs';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { PrismaService } from '../../database/prisma.service.js';
 
 export interface InstitutionTerminology {
@@ -319,6 +319,64 @@ export class SchoolsService {
     return { success: true, academicUnit: unit };
   }
 
+  async updateAcademicUnit(
+    schoolId: string,
+    unitId: string,
+    dto: { name?: string; code?: string; unitType?: string; description?: string },
+  ) {
+    const existing = await this.prisma.academicUnit.findFirst({
+      where: { id: unitId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Section / Faculty not found.');
+    }
+
+    const cleanName = dto.name?.trim() || existing.name;
+    const cleanCode = dto.code?.trim().toUpperCase() || existing.code;
+    const conflict = await this.prisma.academicUnit.findFirst({
+      where: {
+        schoolId,
+        id: { not: unitId },
+        OR: [
+          { code: cleanCode },
+          { name: { equals: cleanName, mode: 'insensitive' } },
+        ],
+      },
+    });
+    if (conflict) {
+      throw new BadRequestException(
+        `Another Section / Faculty already uses "${cleanName}" or code "${cleanCode}".`,
+      );
+    }
+
+    const updated = await this.prisma.academicUnit.update({
+      where: { id: unitId },
+      data: {
+        name: cleanName,
+        code: cleanCode,
+        unitType: dto.unitType?.trim() || existing.unitType,
+        description:
+          dto.description !== undefined ? dto.description?.trim() || null : undefined,
+      },
+    });
+    return { success: true, academicUnit: updated };
+  }
+
+  async deleteAcademicUnit(schoolId: string, unitId: string) {
+    const existing = await this.prisma.academicUnit.findFirst({
+      where: { id: unitId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Section / Faculty not found.');
+    }
+    await this.prisma.department.updateMany({
+      where: { schoolId, unitId },
+      data: { unitId: null },
+    });
+    await this.prisma.academicUnit.delete({ where: { id: unitId } });
+    return { success: true, deletedId: unitId };
+  }
+
   async createDepartment(
     schoolId: string,
     dto: { name: string; code: string; unitId?: string },
@@ -356,9 +414,112 @@ export class SchoolsService {
     return { success: true, department: dept };
   }
 
+  async updateDepartment(
+    schoolId: string,
+    deptId: string,
+    dto: { name?: string; code?: string; unitId?: string | null },
+  ) {
+    const existing = await this.prisma.department.findFirst({
+      where: { id: deptId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Department not found.');
+    }
+
+    const cleanName = dto.name?.trim() || existing.name;
+    const cleanCode = dto.code?.trim().toUpperCase() || existing.code;
+    const conflict = await this.prisma.department.findFirst({
+      where: {
+        schoolId,
+        id: { not: deptId },
+        OR: [
+          { code: cleanCode },
+          { name: { equals: cleanName, mode: 'insensitive' } },
+        ],
+      },
+    });
+    if (conflict) {
+      throw new BadRequestException(
+        `Another department already uses "${cleanName}" or code "${cleanCode}".`,
+      );
+    }
+
+    const updated = await this.prisma.department.update({
+      where: { id: deptId },
+      data: {
+        name: cleanName,
+        code: cleanCode,
+        unitId: dto.unitId !== undefined ? dto.unitId || null : undefined,
+      },
+      include: { unit: true },
+    });
+    return { success: true, department: updated };
+  }
+
+  async deleteDepartment(schoolId: string, deptId: string) {
+    const existing = await this.prisma.department.findFirst({
+      where: { id: deptId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Department not found.');
+    }
+    await Promise.all([
+      this.prisma.schoolClass.updateMany({
+        where: { schoolId, departmentId: deptId },
+        data: { departmentId: null },
+      }),
+      this.prisma.schoolSubject.updateMany({
+        where: { schoolId, departmentId: deptId },
+        data: { departmentId: null },
+      }),
+    ]);
+    await this.prisma.department.delete({ where: { id: deptId } });
+    return { success: true, deletedId: deptId };
+  }
+
+  private normalizeCreditUnits(raw?: number | string | null): number | null {
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+      return null;
+    }
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 30) {
+      return null;
+    }
+    return Math.floor(parsed);
+  }
+
+  private buildAutoCourseCode(name: string, classNameOrCode?: string): string {
+    const clean = name.replace(/[^a-zA-Z0-9\s]/g, '').trim();
+    const words = clean.split(/\s+/).filter(Boolean);
+    const subjPart =
+      words.length >= 2
+        ? words
+            .slice(0, 3)
+            .map((w) => w[0])
+            .join('')
+            .toUpperCase()
+        : clean.slice(0, 3).toUpperCase() || 'SUB';
+    const classPart = (classNameOrCode || '')
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .toUpperCase()
+      .slice(0, 8);
+    return classPart ? `${subjPart}-${classPart}` : `${subjPart}101`;
+  }
+
   async createSchoolClass(
     schoolId: string,
-    dto: { name: string; levelCode?: string; departmentId?: string; termOrSemester?: string },
+    dto: {
+      name: string;
+      levelCode?: string;
+      departmentId?: string;
+      termOrSemester?: string;
+      subjects?: Array<{
+        name: string;
+        courseCode?: string;
+        creditUnits?: number | null;
+        departmentId?: string;
+      }>;
+    },
   ) {
     if (!dto.name?.trim()) {
       throw new BadRequestException('Class/level name is required.');
@@ -390,11 +551,12 @@ export class SchoolsService {
     }
 
     const inviteCode = `CLS-${randomUUID().slice(0, 8).toUpperCase()}`;
+    const levelCode = dto.levelCode?.trim();
     const schoolClass = await this.prisma.schoolClass.create({
       data: {
         schoolId,
         name: cleanName,
-        levelCode: dto.levelCode?.trim(),
+        levelCode,
         departmentId: dto.departmentId || null,
         termOrSemester: dto.termOrSemester?.trim(),
         inviteCode,
@@ -402,61 +564,802 @@ export class SchoolsService {
       include: { department: true },
     });
 
-    return { success: true, schoolClass };
+    let createdSubjects: any[] = [];
+    if (Array.isArray(dto.subjects) && dto.subjects.length > 0) {
+      const batchResult = await this.assignSubjectsToClass(schoolId, schoolClass.id, {
+        subjects: dto.subjects,
+      });
+      createdSubjects = batchResult.subjects;
+    }
+
+    return {
+      success: true,
+      schoolClass: {
+        ...schoolClass,
+        subjects: createdSubjects,
+      },
+    };
+  }
+
+  async assignSubjectsToClass(
+    schoolId: string,
+    classId: string,
+    dto: {
+      subjects: Array<{
+        name: string;
+        courseCode?: string;
+        creditUnits?: number | null;
+        departmentId?: string;
+        minAttendancePercent?: number;
+      }>;
+    },
+  ) {
+    const schoolClass = await this.prisma.schoolClass.findFirst({
+      where: { id: classId, schoolId },
+      include: { subjects: true },
+    });
+    if (!schoolClass) {
+      throw new NotFoundException('Target class not found for this institution.');
+    }
+
+    const items = Array.isArray(dto.subjects) ? dto.subjects : [];
+    const seenNames = new Set(
+      schoolClass.subjects.map((s) => s.name.trim().toLowerCase()),
+    );
+    const seenCodes = new Set(
+      schoolClass.subjects.map((s) => s.courseCode.trim().toUpperCase()),
+    );
+
+    const created: any[] = [];
+    for (const item of items) {
+      const cleanName = item?.name?.trim();
+      if (!cleanName) continue;
+      if (seenNames.has(cleanName.toLowerCase())) continue;
+
+      let cleanCode = (
+        item.courseCode?.trim() ||
+        this.buildAutoCourseCode(
+          cleanName,
+          schoolClass.levelCode || schoolClass.name,
+        )
+      ).toUpperCase();
+
+      // Ensure course code uniqueness inside the class
+      let suffix = 2;
+      const baseCode = cleanCode;
+      while (seenCodes.has(cleanCode)) {
+        cleanCode = `${baseCode}${suffix}`;
+        suffix += 1;
+      }
+
+      const subject = await this.prisma.schoolSubject.create({
+        data: {
+          schoolId,
+          classId: schoolClass.id,
+          departmentId: item.departmentId || schoolClass.departmentId || null,
+          name: cleanName,
+          courseCode: cleanCode,
+          creditUnits: this.normalizeCreditUnits(item.creditUnits),
+          minAttendancePercent: item.minAttendancePercent ?? 75.0,
+        },
+        include: {
+          schoolClass: true,
+          department: true,
+        },
+      });
+      seenNames.add(cleanName.toLowerCase());
+      seenCodes.add(cleanCode);
+      created.push(subject);
+    }
+
+    return { success: true, subjects: created, count: created.length };
   }
 
   async createSchoolSubject(
     schoolId: string,
     dto: {
       name: string;
-      courseCode: string;
-      creditUnits?: number;
-      classId: string;
+      courseCode?: string;
+      creditUnits?: number | null;
+      classId?: string;
+      classIds?: string[];
       departmentId?: string;
       minAttendancePercent?: number;
     },
   ) {
-    if (!dto.name?.trim() || !dto.courseCode?.trim() || !dto.classId) {
-      throw new BadRequestException('Course name, course code, and target class are required.');
+    const targetClassIds = Array.from(
+      new Set([
+        ...(Array.isArray(dto.classIds) ? dto.classIds : []),
+        ...(dto.classId ? [dto.classId] : []),
+      ].filter(Boolean)),
+    );
+
+    if (!dto.name?.trim() || targetClassIds.length === 0) {
+      throw new BadRequestException(
+        'Subject / course name and at least one target class are required.',
+      );
     }
 
     const cleanName = dto.name.trim();
-    const cleanCode = dto.courseCode.trim().toUpperCase();
+    const classes = await this.prisma.schoolClass.findMany({
+      where: { schoolId, id: { in: targetClassIds } },
+    });
+    if (classes.length === 0) {
+      throw new NotFoundException('Target class not found for this institution.');
+    }
 
-    const existingSubject = await this.prisma.schoolSubject.findFirst({
+    const createdSubjects: any[] = [];
+    for (const cls of classes) {
+      const baseCode = (
+        dto.courseCode?.trim() ||
+        this.buildAutoCourseCode(cleanName, cls.levelCode || cls.name)
+      ).toUpperCase();
+
+      const existingSubject = await this.prisma.schoolSubject.findFirst({
+        where: {
+          schoolId,
+          classId: cls.id,
+          OR: [
+            { name: { equals: cleanName, mode: 'insensitive' } },
+            { courseCode: { equals: baseCode, mode: 'insensitive' } },
+          ],
+        },
+      });
+
+      if (existingSubject) {
+        if (classes.length === 1) {
+          throw new BadRequestException(
+            `Subject / Course "${cleanName}" (${baseCode}) is already registered for ${cls.name}.`,
+          );
+        }
+        continue;
+      }
+
+      const subject = await this.prisma.schoolSubject.create({
+        data: {
+          schoolId,
+          classId: cls.id,
+          departmentId: dto.departmentId || cls.departmentId || null,
+          name: cleanName,
+          courseCode: baseCode,
+          creditUnits: this.normalizeCreditUnits(dto.creditUnits),
+          minAttendancePercent: dto.minAttendancePercent ?? 75.0,
+        },
+        include: {
+          schoolClass: true,
+          department: true,
+        },
+      });
+      createdSubjects.push(subject);
+    }
+
+    if (createdSubjects.length === 0) {
+      throw new BadRequestException(
+        `"${cleanName}" is already registered in the selected class(es).`,
+      );
+    }
+
+    return {
+      success: true,
+      subject: createdSubjects[0],
+      subjects: createdSubjects,
+    };
+  }
+
+  async updateSchoolClass(
+    schoolId: string,
+    classId: string,
+    dto: {
+      name?: string;
+      levelCode?: string;
+      departmentId?: string | null;
+      termOrSemester?: string;
+    },
+  ) {
+    const existing = await this.prisma.schoolClass.findFirst({
+      where: { id: classId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Class / Level not found.');
+    }
+
+    const cleanName = dto.name?.trim() || existing.name;
+    const nextDeptId =
+      dto.departmentId !== undefined ? dto.departmentId || null : existing.departmentId;
+
+    const normalizeClassKey = (val: string) =>
+      val.replace(/[\s\-_]+/g, '').toUpperCase();
+    const targetKey = normalizeClassKey(cleanName);
+
+    const peers = await this.prisma.schoolClass.findMany({
+      where: { schoolId, id: { not: classId } },
+      select: { id: true, name: true, departmentId: true },
+    });
+    const duplicate = peers.find((c) => {
+      if (normalizeClassKey(c.name) !== targetKey) return false;
+      if (nextDeptId && c.departmentId && nextDeptId !== c.departmentId) {
+        return false;
+      }
+      return true;
+    });
+    if (duplicate) {
+      throw new BadRequestException(
+        `Class "${cleanName}" already exists in this institution.`,
+      );
+    }
+
+    const updated = await this.prisma.schoolClass.update({
+      where: { id: classId },
+      data: {
+        name: cleanName,
+        levelCode:
+          dto.levelCode !== undefined
+            ? dto.levelCode?.trim().toUpperCase() || null
+            : undefined,
+        departmentId: nextDeptId,
+        termOrSemester:
+          dto.termOrSemester !== undefined
+            ? dto.termOrSemester?.trim() || null
+            : undefined,
+      },
+      include: { department: true, subjects: true },
+    });
+    return { success: true, schoolClass: updated };
+  }
+
+  async deleteSchoolClass(schoolId: string, classId: string) {
+    const existing = await this.prisma.schoolClass.findFirst({
+      where: { id: classId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Class / Level not found.');
+    }
+    await Promise.all([
+      this.prisma.studentProfile.updateMany({
+        where: { schoolId, classId },
+        data: { classId: null },
+      }),
+      this.prisma.user.updateMany({
+        where: { schoolId, classId },
+        data: { classId: null },
+      }),
+    ]);
+    await this.prisma.schoolClass.delete({ where: { id: classId } });
+    return { success: true, deletedId: classId };
+  }
+
+  async updateSchoolSubject(
+    schoolId: string,
+    subjectId: string,
+    dto: {
+      name?: string;
+      courseCode?: string;
+      creditUnits?: number | null;
+      classId?: string;
+      departmentId?: string | null;
+      minAttendancePercent?: number;
+    },
+  ) {
+    const existing = await this.prisma.schoolSubject.findFirst({
+      where: { id: subjectId, schoolId },
+      include: { schoolClass: true },
+    });
+    if (!existing) {
+      throw new NotFoundException('Subject / Course not found.');
+    }
+
+    const targetClassId = dto.classId || existing.classId;
+    const cleanName = dto.name?.trim() || existing.name;
+    const cleanCode = dto.courseCode?.trim().toUpperCase() || existing.courseCode;
+
+    const conflict = await this.prisma.schoolSubject.findFirst({
       where: {
         schoolId,
-        classId: dto.classId,
+        classId: targetClassId,
+        id: { not: subjectId },
         OR: [
           { name: { equals: cleanName, mode: 'insensitive' } },
           { courseCode: { equals: cleanCode, mode: 'insensitive' } },
         ],
       },
     });
-
-    if (existingSubject) {
+    if (conflict) {
       throw new BadRequestException(
-        `Subject / Course "${cleanName}" (${cleanCode}) is already registered for this class.`,
+        `Subject "${cleanName}" (${cleanCode}) is already registered in this class.`,
       );
     }
 
-    const subject = await this.prisma.schoolSubject.create({
+    const updated = await this.prisma.schoolSubject.update({
+      where: { id: subjectId },
       data: {
-        schoolId,
-        classId: dto.classId,
-        departmentId: dto.departmentId || null,
         name: cleanName,
         courseCode: cleanCode,
-        creditUnits: dto.creditUnits ?? 3,
-        minAttendancePercent: dto.minAttendancePercent ?? 75.0,
+        classId: targetClassId,
+        departmentId:
+          dto.departmentId !== undefined ? dto.departmentId || null : undefined,
+        creditUnits:
+          dto.creditUnits !== undefined
+            ? this.normalizeCreditUnits(dto.creditUnits)
+            : undefined,
+        minAttendancePercent:
+          dto.minAttendancePercent !== undefined
+            ? Number(dto.minAttendancePercent) || 75.0
+            : undefined,
       },
+      include: { schoolClass: true, department: true },
+    });
+    return { success: true, subject: updated };
+  }
+
+  async deleteSchoolSubject(schoolId: string, subjectId: string) {
+    const existing = await this.prisma.schoolSubject.findFirst({
+      where: { id: subjectId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Subject / Course not found.');
+    }
+    await this.prisma.schoolSubject.delete({ where: { id: subjectId } });
+    return { success: true, deletedId: subjectId };
+  }
+
+  async getSchoolClassDetails(schoolId: string, classId: string) {
+    const school = await this.prisma.school.findUnique({
+      where: { id: schoolId },
+      select: { id: true, name: true, institutionType: true },
+    });
+    if (!school) throw new NotFoundException('Institution not found.');
+
+    const schoolClass = await this.prisma.schoolClass.findFirst({
+      where: { id: classId, schoolId },
       include: {
-        schoolClass: true,
-        department: true,
+        department: {
+          include: { unit: true },
+        },
+        subjects: {
+          include: {
+            teacher: { select: { id: true, fullName: true, email: true } },
+            assignedTeachers: {
+              include: {
+                user: { select: { id: true, fullName: true, email: true } },
+              },
+            },
+          },
+          orderBy: { name: 'asc' },
+        },
+        teacherProfiles: {
+          include: {
+            user: { select: { id: true, fullName: true, email: true } },
+            assignedSubjects: {
+              where: { classId },
+              select: { id: true, name: true, courseCode: true },
+            },
+          },
+        },
       },
     });
+    if (!schoolClass) {
+      throw new NotFoundException('Class / Level not found in this institution.');
+    }
 
-    return { success: true, subject };
+    const instUpper = String(school.institutionType || '').toUpperCase();
+    const isTertiary =
+      instUpper.includes('UNIV') ||
+      instUpper.includes('POLY') ||
+      instUpper.includes('COLLEG') ||
+      instUpper.includes('TERT');
+
+    const [
+      studentProfiles,
+      currentTerm,
+      attendanceSessions,
+      historyRows,
+      formTeacherUser,
+    ] = await Promise.all([
+      this.prisma.studentProfile.findMany({
+        where: { schoolId, classId },
+        include: {
+          user: {
+            select: {
+              id: true,
+              fullName: true,
+              email: true,
+              avatarUrl: true,
+              loginId: true,
+              createdAt: true,
+            },
+          },
+          department: { select: { id: true, name: true, code: true } },
+        },
+        orderBy: [{ createdAt: 'desc' }],
+      }),
+      this.prisma.academicTerm.findFirst({
+        where: { session: { schoolId } },
+        orderBy: [{ isCurrent: 'desc' }, { createdAt: 'desc' }],
+        include: { session: { select: { name: true } } },
+      }),
+      this.prisma.attendanceSession.findMany({
+        where: { schoolId, classId },
+        include: {
+          subject: { select: { id: true, name: true, courseCode: true } },
+          records: { select: { studentId: true, status: true } },
+        },
+        orderBy: { sessionDate: 'desc' },
+        take: 100,
+      }),
+      this.prisma.classTeacherAssignmentHistory.findMany({
+        where: { schoolId, classId },
+        include: {
+          teacherProfile: {
+            include: {
+              user: { select: { id: true, fullName: true, email: true } },
+            },
+          },
+        },
+        orderBy: [{ assignedAt: 'desc' }],
+      }),
+      schoolClass.formTeacherId
+        ? this.prisma.teacherProfile.findFirst({
+            where: { schoolId, userId: schoolClass.formTeacherId },
+            include: {
+              user: { select: { id: true, fullName: true, email: true } },
+            },
+          })
+        : Promise.resolve(null),
+    ]);
+
+    // Attendance metrics overall and per student
+    const totalSessions = attendanceSessions.length;
+    let presentCount = 0;
+    let lateCount = 0;
+    let excusedCount = 0;
+    let absentCount = 0;
+    const studentAttendedMap = new Map<string, number>();
+
+    for (const sess of attendanceSessions) {
+      for (const rec of sess.records) {
+        if (rec.status === 'PRESENT') {
+          presentCount += 1;
+          studentAttendedMap.set(
+            rec.studentId,
+            (studentAttendedMap.get(rec.studentId) || 0) + 1,
+          );
+        } else if (rec.status === 'LATE') {
+          lateCount += 1;
+          studentAttendedMap.set(
+            rec.studentId,
+            (studentAttendedMap.get(rec.studentId) || 0) + 1,
+          );
+        } else if (rec.status === 'EXCUSED') {
+          excusedCount += 1;
+          studentAttendedMap.set(
+            rec.studentId,
+            (studentAttendedMap.get(rec.studentId) || 0) + 1,
+          );
+        } else {
+          absentCount += 1;
+        }
+      }
+    }
+
+    const totalRollCalls = presentCount + lateCount + excusedCount + absentCount;
+    const overallAttendancePercent =
+      totalRollCalls > 0
+        ? Math.round(((presentCount + lateCount + excusedCount) / totalRollCalls) * 100)
+        : 100;
+
+    // Leading students in current active term
+    let leadingStudents: Array<{
+      studentProfileId: string | null;
+      userId: string;
+      fullName: string;
+      matricOrAdmissionNo: string;
+      overallAverage: number;
+      gpa: number | null;
+      overallPosition: number | null;
+      overallOrdinal: string | null;
+      subjectsGraded: number;
+    }> = [];
+
+    const profileByUserId = new Map(studentProfiles.map((sp) => [sp.userId, sp]));
+
+    if (currentTerm && studentProfiles.length > 0) {
+      const reportCards = await this.prisma.terminalReportCard.findMany({
+        where: { schoolId, classId, termId: currentTerm.id },
+        orderBy: isTertiary
+          ? [{ gpa: 'desc' }, { overallAverage: 'desc' }]
+          : [{ overallPosition: 'asc' }, { overallAverage: 'desc' }],
+        take: 5,
+      });
+
+      if (reportCards.length > 0) {
+        leadingStudents = reportCards
+          .filter((rc) => profileByUserId.has(rc.studentId))
+          .map((rc, idx) => {
+            const sp = profileByUserId.get(rc.studentId)!;
+            return {
+              studentProfileId: sp.id,
+              userId: sp.userId,
+              fullName: sp.user.fullName || 'Student',
+              matricOrAdmissionNo: sp.matricOrAdmissionNo || sp.user.loginId || 'N/A',
+              overallAverage: Math.round((Number(rc.overallAverage) || 0) * 10) / 10,
+              gpa: rc.gpa != null ? Math.round(Number(rc.gpa) * 100) / 100 : null,
+              overallPosition: rc.overallPosition ?? idx + 1,
+              overallOrdinal: rc.overallOrdinal ?? null,
+              subjectsGraded: 0,
+            };
+          });
+      } else {
+        const gradeRows = await this.prisma.studentSubjectGrade.findMany({
+          where: { schoolId, classId, termId: currentTerm.id },
+          select: { studentId: true, totalScore: true, gradePoint: true },
+        });
+        const agg = new Map<string, { sum: number; count: number; gpSum: number }>();
+        for (const g of gradeRows) {
+          const cur = agg.get(g.studentId) || { sum: 0, count: 0, gpSum: 0 };
+          cur.sum += Number(g.totalScore) || 0;
+          cur.gpSum += Number(g.gradePoint) || 0;
+          cur.count += 1;
+          agg.set(g.studentId, cur);
+        }
+        leadingStudents = Array.from(agg.entries())
+          .filter(([uid]) => profileByUserId.has(uid))
+          .map(([uid, stats]) => {
+            const sp = profileByUserId.get(uid)!;
+            return {
+              studentProfileId: sp.id,
+              userId: uid,
+              fullName: sp.user.fullName || 'Student',
+              matricOrAdmissionNo: sp.matricOrAdmissionNo || sp.user.loginId || 'N/A',
+              overallAverage: Math.round((stats.sum / stats.count) * 10) / 10,
+              gpa: Math.round((stats.gpSum / stats.count) * 100) / 100,
+              overallPosition: null,
+              overallOrdinal: null,
+              subjectsGraded: stats.count,
+            };
+          })
+          .sort((a, b) => b.overallAverage - a.overallAverage)
+          .slice(0, 5)
+          .map((item, idx) => ({ ...item, overallPosition: idx + 1 }));
+      }
+    }
+
+    // Current teachers deduplicated
+    const teacherMap = new Map<
+      string,
+      {
+        teacherProfileId: string | null;
+        userId: string;
+        fullName: string;
+        title: string;
+        staffId: string;
+        email: string;
+        roles: Set<string>;
+        subjects: Set<string>;
+      }
+    >();
+
+    const upsertTeacher = (
+      userId: string,
+      info: {
+        teacherProfileId?: string | null;
+        fullName?: string | null;
+        title?: string | null;
+        staffId?: string | null;
+        email?: string | null;
+      },
+      role?: string,
+      subjectName?: string,
+    ) => {
+      let entry = teacherMap.get(userId);
+      if (!entry) {
+        entry = {
+          teacherProfileId: info.teacherProfileId ?? null,
+          userId,
+          fullName: info.fullName || 'Instructor',
+          title: info.title || 'Teacher',
+          staffId: info.staffId || 'STAFF',
+          email: info.email || '',
+          roles: new Set<string>(),
+          subjects: new Set<string>(),
+        };
+        teacherMap.set(userId, entry);
+      }
+      if (role) entry.roles.add(role);
+      if (subjectName) entry.subjects.add(subjectName);
+    };
+
+    if (formTeacherUser) {
+      upsertTeacher(
+        formTeacherUser.userId,
+        {
+          teacherProfileId: formTeacherUser.id,
+          fullName: formTeacherUser.user?.fullName,
+          title: formTeacherUser.title,
+          staffId: formTeacherUser.staffId,
+          email: formTeacherUser.user?.email,
+        },
+        'Form Teacher',
+      );
+    }
+
+    for (const tp of schoolClass.teacherProfiles) {
+      upsertTeacher(
+        tp.userId,
+        {
+          teacherProfileId: tp.id,
+          fullName: tp.user?.fullName,
+          title: tp.title,
+          staffId: tp.staffId,
+          email: tp.user?.email,
+        },
+        'Class Teacher',
+      );
+      for (const s of tp.assignedSubjects) {
+        upsertTeacher(tp.userId, { teacherProfileId: tp.id }, 'Subject Teacher', s.name);
+      }
+    }
+
+    for (const subj of schoolClass.subjects) {
+      if (subj.teacher) {
+        upsertTeacher(
+          subj.teacher.id,
+          {
+            fullName: subj.teacher.fullName,
+            email: subj.teacher.email,
+          },
+          'Subject Teacher',
+          subj.name,
+        );
+      }
+      for (const tp of subj.assignedTeachers) {
+        upsertTeacher(
+          tp.userId,
+          {
+            teacherProfileId: tp.id,
+            fullName: tp.user?.fullName,
+            title: tp.title,
+            staffId: tp.staffId,
+            email: tp.user?.email,
+          },
+          'Subject Teacher',
+          subj.name,
+        );
+      }
+    }
+
+    const currentTeachers = Array.from(teacherMap.values()).map((t) => ({
+      teacherProfileId: t.teacherProfileId,
+      userId: t.userId,
+      fullName: t.fullName,
+      title: t.title,
+      staffId: t.staffId,
+      email: t.email,
+      roles: Array.from(t.roles),
+      subjects: Array.from(t.subjects),
+    }));
+
+    const currentTeacherProfileIds = new Set(
+      currentTeachers.map((t) => t.teacherProfileId).filter(Boolean),
+    );
+    const pastTeachers = historyRows
+      .filter(
+        (h) =>
+          h.unassignedAt !== null &&
+          !currentTeacherProfileIds.has(h.teacherProfileId),
+      )
+      .map((h) => ({
+        historyId: h.id,
+        teacherProfileId: h.teacherProfileId,
+        fullName: h.teacherProfile.user?.fullName || 'Former Teacher',
+        title: h.teacherProfile.title || 'Teacher',
+        staffId: h.teacherProfile.staffId || 'STAFF',
+        email: h.teacherProfile.user?.email || '',
+        roleLabel: h.roleLabel || 'Assigned Teacher',
+        subjectSummary: h.subjectSummary || null,
+        assignedAt: h.assignedAt.toISOString(),
+        unassignedAt: h.unassignedAt ? h.unassignedAt.toISOString() : null,
+      }));
+
+    const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const students = studentProfiles.map((sp) => {
+      const attended = studentAttendedMap.get(sp.userId) || 0;
+      const attPct =
+        totalSessions > 0 ? Math.round((attended / totalSessions) * 100) : null;
+      return {
+        id: sp.id,
+        userId: sp.userId,
+        fullName: sp.user.fullName || 'Student',
+        email: sp.user.email,
+        avatarUrl: sp.user.avatarUrl,
+        matricOrAdmissionNo: sp.matricOrAdmissionNo || sp.user.loginId || 'N/A',
+        age: sp.age ?? null,
+        guardianName: sp.guardianName ?? null,
+        guardianRelationship: sp.guardianRelationship ?? null,
+        guardianEmail: sp.guardianEmail ?? null,
+        guardianPhone: sp.guardianPhone ?? null,
+        departmentName: sp.department?.name || 'General',
+        levelCode: schoolClass.levelCode || sp.level || null,
+        attendancePercent: attPct,
+        createdAt: sp.createdAt.toISOString(),
+        isNew: sp.createdAt.getTime() >= fourteenDaysAgo,
+      };
+    });
+
+    const newStudents = students.filter((s) => s.isNew);
+
+    return {
+      success: true,
+      isTertiary,
+      schoolClass: {
+        id: schoolClass.id,
+        name: schoolClass.name,
+        levelCode: schoolClass.levelCode,
+        inviteCode: schoolClass.inviteCode,
+        department: schoolClass.department
+          ? {
+              id: schoolClass.department.id,
+              name: schoolClass.department.name,
+              code: schoolClass.department.code,
+              unitName: schoolClass.department.unit?.name || null,
+            }
+          : null,
+      },
+      currentTerm: currentTerm
+        ? {
+            id: currentTerm.id,
+            name: currentTerm.name,
+            sessionName: currentTerm.session?.name || '',
+          }
+        : null,
+      counts: {
+        totalStudents: students.length,
+        newStudentsCount: newStudents.length,
+        subjectsCount: schoolClass.subjects.length,
+        currentTeachersCount: currentTeachers.length,
+        pastTeachersCount: pastTeachers.length,
+        attendancePercent: overallAttendancePercent,
+        totalSessions,
+      },
+      subjects: schoolClass.subjects.map((s) => ({
+        id: s.id,
+        name: s.name,
+        courseCode: s.courseCode,
+        creditUnits: s.creditUnits,
+        minAttendancePercent: s.minAttendancePercent,
+        assignedTeachers: [
+          ...(s.teacher
+            ? [{ id: s.teacher.id, fullName: s.teacher.fullName || 'Teacher' }]
+            : []),
+          ...s.assignedTeachers.map((tp) => ({
+            id: tp.id,
+            fullName: tp.user?.fullName || 'Teacher',
+          })),
+        ],
+      })),
+      students,
+      newStudents,
+      leadingStudents,
+      currentTeachers,
+      pastTeachers,
+      attendanceSummary: {
+        overallPercent: overallAttendancePercent,
+        totalSessions,
+        presentCount,
+        lateCount,
+        excusedCount,
+        absentCount,
+        recentSessions: attendanceSessions.slice(0, 8).map((sess) => ({
+          id: sess.id,
+          date: sess.sessionDate.toISOString(),
+          subjectName: sess.subject?.name || 'Class Daily Register',
+          courseCode: sess.subject?.courseCode || schoolClass.name,
+          presentCount: sess.records.filter(
+            (r) => r.status === 'PRESENT' || r.status === 'LATE',
+          ).length,
+          totalMarked: sess.records.length,
+        })),
+      },
+    };
   }
 
   // ============================================================================
@@ -464,8 +1367,77 @@ export class SchoolsService {
   // ============================================================================
 
   async getSchoolStaff(schoolId: string) {
-    const staff = await this.prisma.teacherProfile.findMany({
-      where: { schoolId },
+    const [staffRaw, formAssignedClasses] = await Promise.all([
+      this.prisma.teacherProfile.findMany({
+        where: { schoolId },
+        include: {
+          user: {
+            select: {
+              id: true,
+              fullName: true,
+              email: true,
+              role: true,
+              avatarUrl: true,
+              loginId: true,
+              createdAt: true,
+            },
+          },
+          department: {
+            include: { unit: true },
+          },
+          assignedClasses: {
+            include: {
+              department: true,
+              _count: {
+                select: {
+                  studentProfiles: true,
+                  subjects: true,
+                },
+              },
+            },
+          },
+          assignedSubjects: {
+            include: {
+              schoolClass: true,
+              department: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.schoolClass.findMany({
+        where: { schoolId, formTeacherId: { not: null } },
+        select: {
+          id: true,
+          name: true,
+          levelCode: true,
+          formTeacherId: true,
+        },
+      }),
+    ]);
+
+    const formMap = new Map<
+      string,
+      Array<{ id: string; name: string; levelCode: string | null }>
+    >();
+    for (const c of formAssignedClasses) {
+      if (!c.formTeacherId) continue;
+      const list = formMap.get(c.formTeacherId) || [];
+      list.push({ id: c.id, name: c.name, levelCode: c.levelCode });
+      formMap.set(c.formTeacherId, list);
+    }
+
+    const staff = staffRaw.map((member) => ({
+      ...member,
+      formClasses: formMap.get(member.userId) || [],
+    }));
+
+    return { success: true, staff };
+  }
+
+  async getSchoolStaffDetails(schoolId: string, staffProfileId: string) {
+    const profile = await this.prisma.teacherProfile.findFirst({
+      where: { id: staffProfileId, schoolId },
       include: {
         user: {
           select: {
@@ -474,45 +1446,363 @@ export class SchoolsService {
             email: true,
             role: true,
             avatarUrl: true,
+            loginId: true,
             createdAt: true,
           },
         },
-        department: true,
+        department: {
+          include: { unit: true },
+        },
+        assignedClasses: {
+          include: {
+            department: true,
+            _count: {
+              select: {
+                studentProfiles: true,
+                subjects: true,
+              },
+            },
+          },
+          orderBy: { name: 'asc' },
+        },
+        assignedSubjects: {
+          include: {
+            schoolClass: true,
+            department: true,
+          },
+          orderBy: { name: 'asc' },
+        },
+        classHistory: {
+          include: {
+            schoolClass: {
+              select: { id: true, name: true, levelCode: true },
+            },
+          },
+          orderBy: { assignedAt: 'desc' },
+        },
+      },
+    });
+
+    if (!profile) {
+      throw new NotFoundException('Staff / Teacher profile not found.');
+    }
+
+    const assignedClassIds = Array.from(
+      new Set([
+        ...profile.assignedClasses.map((c) => c.id),
+        ...profile.assignedSubjects.map((s) => s.classId),
+      ]),
+    );
+
+    const [membership, formClasses, totalStudentsReached, attendanceSessionsCount] =
+      await Promise.all([
+        this.prisma.membership.findFirst({
+          where: { userId: profile.userId, schoolId },
+          select: {
+            status: true,
+            mustChangePassword: true,
+            loginId: true,
+            createdAt: true,
+          },
+        }),
+        this.prisma.schoolClass.findMany({
+          where: { schoolId, formTeacherId: profile.userId },
+          include: {
+            department: true,
+            _count: { select: { studentProfiles: true, subjects: true } },
+          },
+        }),
+        assignedClassIds.length > 0
+          ? this.prisma.studentProfile.count({
+              where: { schoolId, classId: { in: assignedClassIds } },
+            })
+          : Promise.resolve(0),
+        this.prisma.attendanceSession.count({
+          where: { schoolId, teacherId: profile.userId },
+        }),
+      ]);
+
+    return {
+      success: true,
+      staff: {
+        ...profile,
+        membership,
+        formClasses,
+        metrics: {
+          assignedClassesCount: profile.assignedClasses.length,
+          assignedSubjectsCount: profile.assignedSubjects.length,
+          formClassesCount: formClasses.length,
+          totalStudentsReached,
+          attendanceSessionsCount,
+        },
+      },
+    };
+  }
+
+  async updateSchoolStaff(
+    schoolId: string,
+    staffProfileId: string,
+    dto: {
+      fullName?: string;
+      email?: string;
+      title?: string;
+      departmentId?: string | null;
+      specialization?: string | null;
+      educationLevel?: string | null;
+      qualificationDetails?: string | null;
+      phoneNumber?: string | null;
+      gender?: string | null;
+      address?: string | null;
+      employmentType?: string | null;
+      yearsOfExperience?: number | string | null;
+      dateHired?: string | null;
+      handlesAllSubjects?: boolean;
+    },
+  ) {
+    const profile = await this.prisma.teacherProfile.findFirst({
+      where: { id: staffProfileId, schoolId },
+      include: { user: true },
+    });
+    if (!profile) {
+      throw new NotFoundException('Staff / Teacher profile not found.');
+    }
+
+    const userUpdateData: any = {};
+    if (dto.fullName?.trim()) {
+      userUpdateData.fullName = dto.fullName.trim();
+    }
+    if (dto.email !== undefined && dto.email.trim()) {
+      const cleanEmail = dto.email.trim().toLowerCase();
+      if (cleanEmail !== profile.user.email.toLowerCase()) {
+        const existingEmail = await this.prisma.user.findUnique({
+          where: { email: cleanEmail },
+        });
+        if (existingEmail && existingEmail.id !== profile.userId) {
+          throw new BadRequestException(
+            `Email "${cleanEmail}" is already in use by another account.`,
+          );
+        }
+        userUpdateData.email = cleanEmail;
+      }
+    }
+
+    if (Object.keys(userUpdateData).length > 0) {
+      await this.prisma.user.update({
+        where: { id: profile.userId },
+        data: userUpdateData,
+      });
+    }
+
+    let parsedYears: number | null | undefined = undefined;
+    if (dto.yearsOfExperience !== undefined) {
+      if (dto.yearsOfExperience === null || dto.yearsOfExperience === '') {
+        parsedYears = null;
+      } else {
+        const n = Number(dto.yearsOfExperience);
+        parsedYears = Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+      }
+    }
+
+    let parsedDateHired: Date | null | undefined = undefined;
+    if (dto.dateHired !== undefined) {
+      if (!dto.dateHired) {
+        parsedDateHired = null;
+      } else {
+        const d = new Date(dto.dateHired);
+        parsedDateHired = Number.isNaN(d.getTime()) ? null : d;
+      }
+    }
+
+    const updated = await this.prisma.teacherProfile.update({
+      where: { id: staffProfileId },
+      data: {
+        title: dto.title !== undefined ? dto.title?.trim() || null : undefined,
+        departmentId:
+          dto.departmentId !== undefined ? dto.departmentId || null : undefined,
+        specialization:
+          dto.specialization !== undefined
+            ? dto.specialization?.trim() || null
+            : undefined,
+        educationLevel:
+          dto.educationLevel !== undefined
+            ? dto.educationLevel?.trim() || null
+            : undefined,
+        qualificationDetails:
+          dto.qualificationDetails !== undefined
+            ? dto.qualificationDetails?.trim() || null
+            : undefined,
+        phoneNumber:
+          dto.phoneNumber !== undefined
+            ? dto.phoneNumber?.trim() || null
+            : undefined,
+        gender:
+          dto.gender !== undefined ? dto.gender?.trim() || null : undefined,
+        address:
+          dto.address !== undefined ? dto.address?.trim() || null : undefined,
+        employmentType:
+          dto.employmentType !== undefined
+            ? dto.employmentType?.trim() || null
+            : undefined,
+        yearsOfExperience: parsedYears,
+        dateHired: parsedDateHired,
+        handlesAllSubjects:
+          dto.handlesAllSubjects !== undefined
+            ? Boolean(dto.handlesAllSubjects)
+            : undefined,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            role: true,
+            avatarUrl: true,
+            loginId: true,
+            createdAt: true,
+          },
+        },
+        department: { include: { unit: true } },
         assignedClasses: true,
         assignedSubjects: true,
       },
-      orderBy: { createdAt: 'desc' },
     });
 
-    return { success: true, staff };
+    return { success: true, teacherProfile: updated };
+  }
+
+  private buildSchoolIdPrefix(
+    schoolName?: string | null,
+    schoolCode?: string | null,
+  ): string {
+    const cleaned = String(schoolName || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '');
+    if (cleaned.length >= 3) {
+      return cleaned.slice(0, 10);
+    }
+    const codeCleaned = String(schoolCode || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '');
+    if (codeCleaned.length >= 2) {
+      return codeCleaned.slice(0, 10);
+    }
+    return 'SCH';
+  }
+
+  private async isMemberIdTakenGlobally(
+    candidate: string,
+    exclude?: {
+      teacherProfileId?: string;
+      studentProfileId?: string;
+      userId?: string;
+    },
+  ): Promise<boolean> {
+    const [teacherHit, studentHit, userHit, membershipHit] = await Promise.all([
+      this.prisma.teacherProfile.findFirst({
+        where: {
+          staffId: { equals: candidate, mode: 'insensitive' },
+          ...(exclude?.teacherProfileId
+            ? { id: { not: exclude.teacherProfileId } }
+            : {}),
+        },
+        select: { id: true },
+      }),
+      this.prisma.studentProfile.findFirst({
+        where: {
+          matricOrAdmissionNo: { equals: candidate, mode: 'insensitive' },
+          ...(exclude?.studentProfileId
+            ? { id: { not: exclude.studentProfileId } }
+            : {}),
+        },
+        select: { id: true },
+      }),
+      this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { loginId: { equals: candidate, mode: 'insensitive' } },
+            { studentCode: { equals: candidate, mode: 'insensitive' } },
+          ],
+          ...(exclude?.userId ? { id: { not: exclude.userId } } : {}),
+        },
+        select: { id: true },
+      }),
+      this.prisma.membership.findFirst({
+        where: {
+          loginId: { equals: candidate, mode: 'insensitive' },
+          ...(exclude?.userId ? { userId: { not: exclude.userId } } : {}),
+        },
+        select: { id: true },
+      }),
+    ]);
+
+    return Boolean(teacherHit || studentHit || userHit || membershipHit);
+  }
+
+  private async generateUniqueMemberId(
+    school: { name?: string | null; schoolCode?: string | null },
+    roleCode: 'TCH' | 'STU',
+  ): Promise<string> {
+    const prefix = this.buildSchoolIdPrefix(school.name, school.schoolCode);
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const bytes = randomBytes(5);
+      let suffix = '';
+      for (let i = 0; i < 5; i += 1) {
+        suffix += alphabet[bytes[i] % alphabet.length];
+      }
+      const candidate = `${prefix}-${roleCode}-${suffix}`;
+      const taken = await this.isMemberIdTakenGlobally(candidate);
+      if (!taken) {
+        return candidate;
+      }
+    }
+    throw new BadRequestException(
+      'Could not allocate a unique institution ID. Please try again.',
+    );
   }
 
   async createSchoolStaff(
     schoolId: string,
     dto: {
       fullName: string;
-      staffId: string;
+      staffId?: string;
       email?: string;
       title?: string;
       departmentId?: string;
       specialization?: string;
+      educationLevel?: string;
+      qualificationDetails?: string;
+      phoneNumber?: string;
+      gender?: string;
+      address?: string;
+      employmentType?: string;
+      yearsOfExperience?: number | string | null;
+      dateHired?: string;
+      handlesAllSubjects?: boolean;
+      formClassIds?: string[];
       assignedClassIds?: string[];
       assignedSubjectIds?: string[];
     },
   ) {
-    if (!dto.fullName?.trim() || !dto.staffId?.trim()) {
-      throw new BadRequestException('Full name and Staff ID are required.');
+    if (!dto.fullName?.trim()) {
+      throw new BadRequestException('Full name is required.');
     }
 
-    const cleanStaffId = dto.staffId.trim().toUpperCase();
     const school = await this.prisma.school.findUnique({ where: { id: schoolId } });
     if (!school) throw new NotFoundException('School not found');
 
-    const existingProfile = await this.prisma.teacherProfile.findFirst({
-      where: { schoolId, staffId: cleanStaffId },
-    });
-    if (existingProfile) {
-      throw new BadRequestException(`Staff ID "${cleanStaffId}" is already registered in this institution.`);
+    const providedStaffId = dto.staffId?.trim().toUpperCase();
+    let cleanStaffId = providedStaffId;
+    if (cleanStaffId) {
+      const taken = await this.isMemberIdTakenGlobally(cleanStaffId);
+      if (taken) {
+        throw new BadRequestException(
+          `Staff ID "${cleanStaffId}" is already registered.`,
+        );
+      }
+    } else {
+      cleanStaffId = await this.generateUniqueMemberId(school, 'TCH');
     }
 
     const safeSlug = (school.slug || 'school').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -565,6 +1855,25 @@ export class SchoolsService {
       });
     }
 
+    let parsedYears: number | null = null;
+    if (dto.yearsOfExperience !== undefined && dto.yearsOfExperience !== null && dto.yearsOfExperience !== '') {
+      const n = Number(dto.yearsOfExperience);
+      if (Number.isFinite(n) && n >= 0) parsedYears = Math.floor(n);
+    }
+
+    let parsedDateHired: Date | null = null;
+    if (dto.dateHired) {
+      const d = new Date(dto.dateHired);
+      if (!Number.isNaN(d.getTime())) parsedDateHired = d;
+    }
+
+    const cleanClassIds = Array.from(
+      new Set([
+        ...(dto.assignedClassIds || []),
+        ...(dto.handlesAllSubjects && dto.formClassIds?.length ? dto.formClassIds : []),
+      ]),
+    );
+
     const teacherProfile = await this.prisma.teacherProfile.create({
       data: {
         userId: user.id,
@@ -572,25 +1881,67 @@ export class SchoolsService {
         staffId: cleanStaffId,
         title: dto.title?.trim() || 'Lecturer',
         departmentId: dto.departmentId || null,
-        specialization: dto.specialization?.trim(),
-        assignedClasses: dto.assignedClassIds?.length
-          ? { connect: dto.assignedClassIds.map((id) => ({ id })) }
+        specialization: dto.specialization?.trim() || null,
+        educationLevel: dto.educationLevel?.trim() || null,
+        qualificationDetails: dto.qualificationDetails?.trim() || null,
+        phoneNumber: dto.phoneNumber?.trim() || null,
+        gender: dto.gender?.trim() || null,
+        address: dto.address?.trim() || null,
+        employmentType: dto.employmentType?.trim() || null,
+        yearsOfExperience: parsedYears,
+        dateHired: parsedDateHired,
+        handlesAllSubjects: Boolean(dto.handlesAllSubjects),
+        assignedClasses: cleanClassIds.length
+          ? { connect: cleanClassIds.map((id) => ({ id })) }
           : undefined,
         assignedSubjects: dto.assignedSubjectIds?.length
           ? { connect: dto.assignedSubjectIds.map((id) => ({ id })) }
           : undefined,
       },
       include: {
-        user: true,
-        department: true,
-        assignedClasses: true,
-        assignedSubjects: true,
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            role: true,
+            avatarUrl: true,
+            loginId: true,
+            createdAt: true,
+          },
+        },
+        department: { include: { unit: true } },
+        assignedClasses: {
+          include: {
+            department: true,
+            _count: { select: { studentProfiles: true, subjects: true } },
+          },
+        },
+        assignedSubjects: {
+          include: { schoolClass: true, department: true },
+        },
       },
     });
 
+    const formClasses = dto.formClassIds?.length
+      ? await this.syncFormTeacherClasses(schoolId, user.id, dto.formClassIds)
+      : [];
+
+    await this.syncTeacherClassHistory(
+      schoolId,
+      teacherProfile.id,
+      cleanClassIds,
+      dto.assignedSubjectIds || [],
+      dto.formClassIds || [],
+      Boolean(dto.handlesAllSubjects),
+    );
+
     return {
       success: true,
-      teacherProfile,
+      teacherProfile: {
+        ...teacherProfile,
+        formClasses,
+      },
       credentialSlip: {
         fullName: dto.fullName.trim(),
         title: dto.title || 'Lecturer',
@@ -605,21 +1956,173 @@ export class SchoolsService {
     };
   }
 
+  private async syncFormTeacherClasses(
+    schoolId: string,
+    userId: string,
+    formClassIds: string[],
+  ) {
+    const uniqueFormIds = Array.from(new Set(formClassIds.filter(Boolean)));
+    await this.prisma.schoolClass.updateMany({
+      where: {
+        schoolId,
+        formTeacherId: userId,
+        ...(uniqueFormIds.length > 0 ? { id: { notIn: uniqueFormIds } } : {}),
+      },
+      data: { formTeacherId: null },
+    });
+
+    if (uniqueFormIds.length > 0) {
+      await this.prisma.schoolClass.updateMany({
+        where: { schoolId, id: { in: uniqueFormIds } },
+        data: { formTeacherId: userId },
+      });
+    }
+
+    return this.prisma.schoolClass.findMany({
+      where: { schoolId, formTeacherId: userId },
+      select: { id: true, name: true, levelCode: true },
+    });
+  }
+
+  private async syncTeacherClassHistory(
+    schoolId: string,
+    teacherProfileId: string,
+    assignedClassIds: string[],
+    assignedSubjectIds: string[],
+    formClassIds: string[] = [],
+    handlesAllSubjects = false,
+  ) {
+    const subjects = assignedSubjectIds.length
+      ? await this.prisma.schoolSubject.findMany({
+          where: { schoolId, id: { in: assignedSubjectIds } },
+          select: { classId: true, name: true },
+        })
+      : [];
+
+    const activeClassIds = new Set<string>([...assignedClassIds, ...formClassIds]);
+    const subjByClass = new Map<string, string[]>();
+    for (const s of subjects) {
+      activeClassIds.add(s.classId);
+      const list = subjByClass.get(s.classId) || [];
+      list.push(s.name);
+      subjByClass.set(s.classId, list);
+    }
+
+    const resolveRoleLabel = (cid: string) => {
+      const isForm = formClassIds.includes(cid);
+      const isFullClass = handlesAllSubjects && assignedClassIds.includes(cid);
+      if (isForm && isFullClass) return 'Form & Full-Class Teacher';
+      if (isForm) return 'Form Teacher';
+      if (isFullClass) return 'Class Teacher (All Subjects)';
+      if (assignedClassIds.includes(cid)) return 'Class Teacher';
+      return 'Subject Teacher';
+    };
+
+    const openRows = await this.prisma.classTeacherAssignmentHistory.findMany({
+      where: { schoolId, teacherProfileId, unassignedAt: null },
+    });
+
+    const openClassIds = new Set<string>();
+    const now = new Date();
+    for (const row of openRows) {
+      if (!activeClassIds.has(row.classId)) {
+        await this.prisma.classTeacherAssignmentHistory.update({
+          where: { id: row.id },
+          data: { unassignedAt: now },
+        });
+      } else {
+        openClassIds.add(row.classId);
+        const subjSummary =
+          handlesAllSubjects && assignedClassIds.includes(row.classId)
+            ? 'All Class Subjects'
+            : (subjByClass.get(row.classId) || []).join(', ');
+        const nextRole = resolveRoleLabel(row.classId);
+        if ((subjSummary && subjSummary !== row.subjectSummary) || nextRole !== row.roleLabel) {
+          await this.prisma.classTeacherAssignmentHistory.update({
+            where: { id: row.id },
+            data: {
+              roleLabel: nextRole,
+              ...(subjSummary ? { subjectSummary: subjSummary } : {}),
+            },
+          });
+        }
+      }
+    }
+
+    for (const cid of activeClassIds) {
+      if (!openClassIds.has(cid)) {
+        const subjSummary =
+          handlesAllSubjects && assignedClassIds.includes(cid)
+            ? 'All Class Subjects'
+            : (subjByClass.get(cid) || []).join(', ');
+        await this.prisma.classTeacherAssignmentHistory.create({
+          data: {
+            schoolId,
+            classId: cid,
+            teacherProfileId,
+            roleLabel: resolveRoleLabel(cid),
+            subjectSummary: subjSummary || null,
+          },
+        });
+      }
+    }
+  }
+
   async assignTeacherCourses(
     schoolId: string,
     teacherProfileId: string,
-    dto: { classIds?: string[]; subjectIds?: string[] },
+    dto: {
+      classIds?: string[];
+      subjectIds?: string[];
+      formClassIds?: string[];
+      handlesAllSubjects?: boolean;
+    },
   ) {
     const profile = await this.prisma.teacherProfile.findFirst({
       where: { id: teacherProfileId, schoolId },
+      include: {
+        assignedClasses: { select: { id: true } },
+        assignedSubjects: { select: { id: true } },
+      },
     });
     if (!profile) throw new NotFoundException('Teacher profile not found.');
+
+    const existingFormClasses = await this.prisma.schoolClass.findMany({
+      where: { schoolId, formTeacherId: profile.userId },
+      select: { id: true },
+    });
+
+    const nextHandlesAll =
+      dto.handlesAllSubjects !== undefined
+        ? Boolean(dto.handlesAllSubjects)
+        : profile.handlesAllSubjects;
+    const nextFormClassIds =
+      dto.formClassIds !== undefined
+        ? dto.formClassIds
+        : existingFormClasses.map((c) => c.id);
+    const nextClassIds = Array.from(
+      new Set([
+        ...(dto.classIds ?? profile.assignedClasses.map((c) => c.id)),
+        ...(nextHandlesAll && nextFormClassIds.length > 0 && dto.classIds === undefined
+          ? nextFormClassIds
+          : []),
+      ]),
+    );
+    const nextSubjectIds =
+      dto.subjectIds ?? profile.assignedSubjects.map((s) => s.id);
 
     const updated = await this.prisma.teacherProfile.update({
       where: { id: teacherProfileId },
       data: {
-        assignedClasses: dto.classIds ? { set: dto.classIds.map((id) => ({ id })) } : undefined,
-        assignedSubjects: dto.subjectIds ? { set: dto.subjectIds.map((id) => ({ id })) } : undefined,
+        handlesAllSubjects:
+          dto.handlesAllSubjects !== undefined ? nextHandlesAll : undefined,
+        assignedClasses:
+          dto.classIds !== undefined
+            ? { set: nextClassIds.map((id) => ({ id })) }
+            : undefined,
+        assignedSubjects: dto.subjectIds
+          ? { set: dto.subjectIds.map((id) => ({ id })) }
+          : undefined,
       },
       include: {
         user: true,
@@ -628,7 +2131,27 @@ export class SchoolsService {
       },
     });
 
-    return { success: true, teacherProfile: updated };
+    const formClasses =
+      dto.formClassIds !== undefined
+        ? await this.syncFormTeacherClasses(schoolId, profile.userId, nextFormClassIds)
+        : existingFormClasses;
+
+    await this.syncTeacherClassHistory(
+      schoolId,
+      teacherProfileId,
+      nextClassIds,
+      nextSubjectIds,
+      nextFormClassIds,
+      nextHandlesAll,
+    );
+
+    return {
+      success: true,
+      teacherProfile: {
+        ...updated,
+        formClasses,
+      },
+    };
   }
 
   // ============================================================================
@@ -690,30 +2213,49 @@ export class SchoolsService {
     };
   }
 
+  private normalizeStudentAge(raw?: number | string | null): number | null {
+    if (raw === undefined || raw === null || String(raw).trim() === '') {
+      return null;
+    }
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 1 || n > 120) return null;
+    return Math.floor(n);
+  }
+
   async createSchoolStudent(
     schoolId: string,
     dto: {
       fullName: string;
-      matricOrAdmissionNo: string;
+      matricOrAdmissionNo?: string;
       email?: string;
       departmentId?: string;
       classId?: string;
       level?: string;
+      age?: number | string | null;
+      guardianName?: string;
+      guardianRelationship?: string;
+      guardianEmail?: string;
+      guardianPhone?: string;
     },
   ) {
-    if (!dto.fullName?.trim() || !dto.matricOrAdmissionNo?.trim()) {
-      throw new BadRequestException('Full name and Matric/Admission number are required.');
+    if (!dto.fullName?.trim()) {
+      throw new BadRequestException('Student full name is required.');
     }
 
-    const cleanMatric = dto.matricOrAdmissionNo.trim().toUpperCase();
     const school = await this.prisma.school.findUnique({ where: { id: schoolId } });
     if (!school) throw new NotFoundException('School not found');
 
-    const existing = await this.prisma.studentProfile.findFirst({
-      where: { schoolId, matricOrAdmissionNo: cleanMatric },
-    });
-    if (existing) {
-      throw new BadRequestException(`Student with Matric/Admission "${cleanMatric}" already exists.`);
+    const providedMatric = dto.matricOrAdmissionNo?.trim().toUpperCase();
+    let cleanMatric = providedMatric;
+    if (cleanMatric) {
+      const taken = await this.isMemberIdTakenGlobally(cleanMatric);
+      if (taken) {
+        throw new BadRequestException(
+          `Student ID "${cleanMatric}" is already in use.`,
+        );
+      }
+    } else {
+      cleanMatric = await this.generateUniqueMemberId(school, 'STU');
     }
 
     const safeSlug = (school.slug || 'school').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -776,6 +2318,11 @@ export class SchoolsService {
         departmentId: dto.departmentId || null,
         classId: dto.classId || null,
         level: dto.level?.trim() || '100L',
+        age: this.normalizeStudentAge(dto.age),
+        guardianName: dto.guardianName?.trim() || null,
+        guardianRelationship: dto.guardianRelationship?.trim() || null,
+        guardianEmail: dto.guardianEmail?.trim()?.toLowerCase() || null,
+        guardianPhone: dto.guardianPhone?.trim() || null,
       },
       include: {
         user: true,
@@ -810,11 +2357,45 @@ export class SchoolsService {
       level?: string;
     },
   ) {
+    return this.updateSchoolStudent(schoolId, studentProfileId, dto);
+  }
+
+  async updateSchoolStudent(
+    schoolId: string,
+    studentProfileId: string,
+    dto: {
+      fullName?: string;
+      matricOrAdmissionNo?: string;
+      email?: string;
+      classId?: string | null;
+      departmentId?: string | null;
+      level?: string;
+      age?: number | string | null;
+      guardianName?: string | null;
+      guardianRelationship?: string | null;
+      guardianEmail?: string | null;
+      guardianPhone?: string | null;
+    },
+  ) {
     const profile = await this.prisma.studentProfile.findFirst({
       where: { id: studentProfileId, schoolId },
+      include: { user: true },
     });
     if (!profile) {
       throw new NotFoundException('Student profile not found in this institution.');
+    }
+
+    const cleanMatric = dto.matricOrAdmissionNo?.trim().toUpperCase();
+    if (cleanMatric && cleanMatric !== profile.matricOrAdmissionNo) {
+      const conflict = await this.isMemberIdTakenGlobally(cleanMatric, {
+        studentProfileId,
+        userId: profile.userId,
+      });
+      if (conflict) {
+        throw new BadRequestException(
+          `ID "${cleanMatric}" is already in use.`,
+        );
+      }
     }
 
     let resolvedClassId = dto.classId !== undefined ? dto.classId : profile.classId;
@@ -831,7 +2412,7 @@ export class SchoolsService {
       if (!dto.level && cls.name) {
         resolvedLevel = cls.name;
       }
-      if (!resolvedDeptId && cls.departmentId) {
+      if (dto.departmentId === undefined && !resolvedDeptId && cls.departmentId) {
         resolvedDeptId = cls.departmentId;
       }
     }
@@ -840,9 +2421,23 @@ export class SchoolsService {
       this.prisma.studentProfile.update({
         where: { id: studentProfileId },
         data: {
+          ...(cleanMatric ? { matricOrAdmissionNo: cleanMatric } : {}),
           classId: resolvedClassId || null,
           departmentId: resolvedDeptId || null,
           level: resolvedLevel,
+          ...(dto.age !== undefined ? { age: this.normalizeStudentAge(dto.age) } : {}),
+          ...(dto.guardianName !== undefined
+            ? { guardianName: dto.guardianName?.trim() || null }
+            : {}),
+          ...(dto.guardianRelationship !== undefined
+            ? { guardianRelationship: dto.guardianRelationship?.trim() || null }
+            : {}),
+          ...(dto.guardianEmail !== undefined
+            ? { guardianEmail: dto.guardianEmail?.trim()?.toLowerCase() || null }
+            : {}),
+          ...(dto.guardianPhone !== undefined
+            ? { guardianPhone: dto.guardianPhone?.trim() || null }
+            : {}),
         },
         include: {
           user: {
@@ -863,6 +2458,9 @@ export class SchoolsService {
       this.prisma.user.update({
         where: { id: profile.userId },
         data: {
+          ...(dto.fullName?.trim() ? { fullName: dto.fullName.trim() } : {}),
+          ...(dto.email?.trim() ? { email: dto.email.trim().toLowerCase() } : {}),
+          ...(cleanMatric ? { loginId: cleanMatric } : {}),
           classId: resolvedClassId || null,
         },
       }),
@@ -1343,6 +2941,11 @@ export class SchoolsService {
         classId?: string;
         className?: string;
         level?: string;
+        age?: number | string | null;
+        guardianName?: string;
+        guardianRelationship?: string;
+        guardianEmail?: string;
+        guardianPhone?: string;
       }>;
     },
   ) {
@@ -1423,6 +3026,11 @@ export class SchoolsService {
           departmentId: deptId,
           classId: clsId,
           level: row.level || row.className || '100L',
+          age: row.age,
+          guardianName: row.guardianName,
+          guardianRelationship: row.guardianRelationship,
+          guardianEmail: row.guardianEmail,
+          guardianPhone: row.guardianPhone,
         });
         slips.push(res.credentialSlip);
       } catch (err: any) {

@@ -221,6 +221,7 @@ model School {
   marketplaceItems   MarketplaceItem[]
   communities        StudyCommunity[]
   notifications      Notification[]
+  calendarEvents     SchoolCalendarEvent[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -243,21 +244,49 @@ model AcademicSession {
 }
 
 model AcademicTerm {
-  id            String                @id @default(uuid())
-  sessionId     String
-  session       AcademicSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  name          String
-  isCurrent     Boolean               @default(false)
-  startDate     DateTime?
-  endDate       DateTime?
-  subjectGrades StudentSubjectGrade[]
-  reportCards   TerminalReportCard[]
-  feeItems      SchoolFeeItem[]
-  createdAt     DateTime              @default(now())
-  updatedAt     DateTime              @updatedAt
+  id                  String                @id @default(uuid())
+  sessionId           String
+  session             AcademicSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  name                String
+  isCurrent           Boolean               @default(false)
+  isEnabled           Boolean               @default(false)
+  isClosed            Boolean               @default(false)
+  startDate           DateTime?
+  endDate             DateTime?
+  nextTermResumesDate DateTime?
+  subjectGrades       StudentSubjectGrade[]
+  reportCards         TerminalReportCard[]
+  feeItems            SchoolFeeItem[]
+  calendarEvents      SchoolCalendarEvent[]
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
 
   @@index([sessionId])
   @@map("academic_terms")
+}
+
+enum CalendarBreakType {
+  HOLIDAY
+  MID_TERM
+  OTHER
+}
+
+model SchoolCalendarEvent {
+  id          String            @id @default(uuid())
+  schoolId    String
+  school      School            @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  termId      String
+  term        AcademicTerm      @relation(fields: [termId], references: [id], onDelete: Cascade)
+  title       String
+  type        CalendarBreakType @default(HOLIDAY)
+  startDate   DateTime
+  endDate     DateTime
+  description String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([schoolId, termId])
+  @@map("school_calendar_events")
 }
 
 model AcademicUnit {
@@ -308,9 +337,10 @@ model SchoolClass {
   name               String
   levelCode          String?
   termOrSemester     String?
-  inviteCode         String                @unique
-  formTeacherId      String?
-  students           User[]
+  inviteCode           String                @unique
+  formTeacherId        String?
+  minAttendancePercent Int                   @default(75)
+  students             User[]
   subjects           SchoolSubject[]
   enrollments        ClassEnrollment[]
   teacherProfiles    TeacherProfile[]
@@ -321,6 +351,7 @@ model SchoolClass {
   subjectGrades      StudentSubjectGrade[]
   reportCards        TerminalReportCard[]
   marketplaceItems   MarketplaceItem[]
+  teacherHistory     ClassTeacherAssignmentHistory[]
   createdAt          DateTime              @default(now())
   updatedAt          DateTime              @updatedAt
 
@@ -342,7 +373,7 @@ model SchoolSubject {
   assignedTeachers     TeacherProfile[]
   name                 String
   courseCode           String
-  creditUnits          Int                   @default(3)
+  creditUnits          Int?
   minAttendancePercent Float                 @default(75.0)
   notes                Note[]
   quizzes              Quiz[]
@@ -473,23 +504,34 @@ model Membership {
 }
 
 model TeacherProfile {
-  id               String          @id @default(uuid())
-  userId           String          @unique
-  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  schoolId         String
-  school           School          @relation(fields: [schoolId], references: [id], onDelete: Cascade)
-  staffId          String?
-  departmentId     String?
-  department       Department?     @relation(fields: [departmentId], references: [id], onDelete: SetNull)
-  title            String?         @default("Teacher")
-  specialization   String?
-  assignedClasses  SchoolClass[]
-  assignedSubjects SchoolSubject[]
-  createdAt        DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
+  id                   String          @id @default(uuid())
+  userId               String          @unique
+  user                 User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  schoolId             String
+  school               School          @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  staffId              String?
+  departmentId         String?
+  department           Department?     @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  title                String?         @default("Teacher")
+  specialization       String?
+  educationLevel       String?
+  qualificationDetails String?
+  phoneNumber          String?
+  gender               String?
+  address              String?
+  employmentType       String?
+  yearsOfExperience    Int?
+  dateHired            DateTime?
+  handlesAllSubjects   Boolean         @default(false)
+  assignedClasses      SchoolClass[]
+  assignedSubjects     SchoolSubject[]
+  classHistory         ClassTeacherAssignmentHistory[]
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
 
   @@unique([schoolId, staffId])
   @@index([schoolId])
+  @@index([staffId])
   @@map("teacher_profiles")
 }
 
@@ -504,16 +546,39 @@ model StudentProfile {
   department          Department?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
   classId             String?
   schoolClass         SchoolClass? @relation(fields: [classId], references: [id], onDelete: SetNull)
-  level               String?      @default("100L")
-  cgpa                Float        @default(0.0)
-  totalCredits        Int          @default(0)
-  createdAt           DateTime     @default(now())
-  updatedAt           DateTime     @updatedAt
+  level                String?      @default("100L")
+  age                  Int?
+  guardianName         String?
+  guardianRelationship String?
+  guardianEmail        String?
+  guardianPhone        String?
+  cgpa                 Float        @default(0.0)
+  totalCredits         Int          @default(0)
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
 
   @@unique([schoolId, matricOrAdmissionNo])
   @@index([schoolId, departmentId])
   @@index([schoolId, classId])
+  @@index([matricOrAdmissionNo])
   @@map("student_profiles")
+}
+
+model ClassTeacherAssignmentHistory {
+  id               String         @id @default(uuid())
+  schoolId         String
+  classId          String
+  schoolClass      SchoolClass    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  teacherProfileId String
+  teacherProfile   TeacherProfile @relation(fields: [teacherProfileId], references: [id], onDelete: Cascade)
+  roleLabel        String?
+  subjectSummary   String?
+  assignedAt       DateTime       @default(now())
+  unassignedAt     DateTime?
+
+  @@index([schoolId, classId])
+  @@index([teacherProfileId])
+  @@map("class_teacher_assignment_history")
 }
 
 model AuditLog {
@@ -784,8 +849,8 @@ model AttendanceSession {
   school       School             @relation(fields: [schoolId], references: [id], onDelete: Cascade)
   classId      String
   schoolClass  SchoolClass        @relation(fields: [classId], references: [id], onDelete: Cascade)
-  subjectId    String
-  subject      SchoolSubject      @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  subjectId    String?
+  subject      SchoolSubject?     @relation(fields: [subjectId], references: [id], onDelete: Cascade)
   teacherId    String
   sessionDate  DateTime           @default(now())
   pinCode      String?
@@ -812,16 +877,18 @@ model AttendanceRecord {
 }
 
 model AssessmentConfig {
-  id             String         @id @default(uuid())
-  schoolId       String
-  school         School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
-  subjectId      String?        @unique
-  subject        SchoolSubject? @relation(fields: [subjectId], references: [id], onDelete: Cascade)
-  componentsJson Json
-  gradeScaleJson Json
-  gpaScaleMax    Float          @default(5.0)
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  id                 String         @id @default(uuid())
+  schoolId           String
+  school             School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  subjectId          String?        @unique
+  subject            SchoolSubject? @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  componentsJson     Json
+  gradeScaleJson     Json
+  traitsConfigJson   Json?
+  reportCardMetaJson Json?
+  gpaScaleMax        Float          @default(5.0)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
 
   @@index([schoolId])
   @@map("assessment_configs")
@@ -874,6 +941,7 @@ model TerminalReportCard {
   examEligible      Boolean      @default(true)
   teacherRemark     String?      @db.Text
   principalRemark   String?      @db.Text
+  traitRatingsJson  Json?
   published         Boolean      @default(false)
   pdfUrl            String?
   createdAt         DateTime     @default(now())

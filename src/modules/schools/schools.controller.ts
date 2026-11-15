@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -72,6 +73,29 @@ export class SchoolsController {
     return this.schoolsService.createAcademicUnit(schoolId, dto);
   }
 
+  @Patch(':schoolId/hierarchy/academic-unit/:unitId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('UPDATE_ACADEMIC_UNIT', 'AcademicUnit')
+  updateAcademicUnit(
+    @Param('schoolId') schoolId: string,
+    @Param('unitId') unitId: string,
+    @Body() dto: { name?: string; code?: string; unitType?: string; description?: string },
+  ) {
+    return this.schoolsService.updateAcademicUnit(schoolId, unitId, dto);
+  }
+
+  @Delete(':schoolId/hierarchy/academic-unit/:unitId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('DELETE_ACADEMIC_UNIT', 'AcademicUnit')
+  deleteAcademicUnit(
+    @Param('schoolId') schoolId: string,
+    @Param('unitId') unitId: string,
+  ) {
+    return this.schoolsService.deleteAcademicUnit(schoolId, unitId);
+  }
+
   @Post(':schoolId/hierarchy/department')
   @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
   @UseGuards(TenantGuard, RolesGuard)
@@ -83,15 +107,110 @@ export class SchoolsController {
     return this.schoolsService.createDepartment(schoolId, dto);
   }
 
+  @Patch(':schoolId/hierarchy/department/:deptId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('UPDATE_DEPARTMENT', 'Department')
+  updateDepartment(
+    @Param('schoolId') schoolId: string,
+    @Param('deptId') deptId: string,
+    @Body() dto: { name?: string; code?: string; unitId?: string | null },
+  ) {
+    return this.schoolsService.updateDepartment(schoolId, deptId, dto);
+  }
+
+  @Delete(':schoolId/hierarchy/department/:deptId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('DELETE_DEPARTMENT', 'Department')
+  deleteDepartment(
+    @Param('schoolId') schoolId: string,
+    @Param('deptId') deptId: string,
+  ) {
+    return this.schoolsService.deleteDepartment(schoolId, deptId);
+  }
+
   @Post(':schoolId/hierarchy/class')
   @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
   @UseGuards(TenantGuard, RolesGuard)
   @AuditAction('CREATE_CLASS', 'SchoolClass')
   createSchoolClass(
     @Param('schoolId') schoolId: string,
-    @Body() dto: { name: string; levelCode?: string; departmentId?: string; termOrSemester?: string },
+    @Body()
+    dto: {
+      name: string;
+      levelCode?: string;
+      departmentId?: string;
+      termOrSemester?: string;
+      subjects?: Array<{
+        name: string;
+        courseCode?: string;
+        creditUnits?: number | null;
+        departmentId?: string;
+      }>;
+    },
   ) {
     return this.schoolsService.createSchoolClass(schoolId, dto);
+  }
+
+  @Get(':schoolId/hierarchy/class/:classId/details')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN', 'TEACHER')
+  @UseGuards(TenantGuard, RolesGuard)
+  getSchoolClassDetails(
+    @Param('schoolId') schoolId: string,
+    @Param('classId') classId: string,
+  ) {
+    return this.schoolsService.getSchoolClassDetails(schoolId, classId);
+  }
+
+  @Patch(':schoolId/hierarchy/class/:classId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('UPDATE_CLASS', 'SchoolClass')
+  updateSchoolClass(
+    @Param('schoolId') schoolId: string,
+    @Param('classId') classId: string,
+    @Body()
+    dto: {
+      name?: string;
+      levelCode?: string;
+      departmentId?: string | null;
+      termOrSemester?: string;
+    },
+  ) {
+    return this.schoolsService.updateSchoolClass(schoolId, classId, dto);
+  }
+
+  @Delete(':schoolId/hierarchy/class/:classId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('DELETE_CLASS', 'SchoolClass')
+  deleteSchoolClass(
+    @Param('schoolId') schoolId: string,
+    @Param('classId') classId: string,
+  ) {
+    return this.schoolsService.deleteSchoolClass(schoolId, classId);
+  }
+
+  @Post(':schoolId/hierarchy/class/:classId/subjects')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('ASSIGN_CLASS_SUBJECTS', 'SchoolClass')
+  assignSubjectsToClass(
+    @Param('schoolId') schoolId: string,
+    @Param('classId') classId: string,
+    @Body()
+    dto: {
+      subjects: Array<{
+        name: string;
+        courseCode?: string;
+        creditUnits?: number | null;
+        departmentId?: string;
+        minAttendancePercent?: number;
+      }>;
+    },
+  ) {
+    return this.schoolsService.assignSubjectsToClass(schoolId, classId, dto);
   }
 
   @Post(':schoolId/hierarchy/subject')
@@ -103,9 +222,10 @@ export class SchoolsController {
     @Body()
     dto: {
       name: string;
-      courseCode: string;
-      creditUnits?: number;
-      classId: string;
+      courseCode?: string;
+      creditUnits?: number | null;
+      classId?: string;
+      classIds?: string[];
       departmentId?: string;
       minAttendancePercent?: number;
     },
@@ -113,13 +233,54 @@ export class SchoolsController {
     return this.schoolsService.createSchoolSubject(schoolId, dto);
   }
 
+  @Patch(':schoolId/hierarchy/subject/:subjectId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('UPDATE_SUBJECT', 'SchoolSubject')
+  updateSchoolSubject(
+    @Param('schoolId') schoolId: string,
+    @Param('subjectId') subjectId: string,
+    @Body()
+    dto: {
+      name?: string;
+      courseCode?: string;
+      creditUnits?: number | null;
+      classId?: string;
+      departmentId?: string | null;
+      minAttendancePercent?: number;
+    },
+  ) {
+    return this.schoolsService.updateSchoolSubject(schoolId, subjectId, dto);
+  }
+
+  @Delete(':schoolId/hierarchy/subject/:subjectId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('DELETE_SUBJECT', 'SchoolSubject')
+  deleteSchoolSubject(
+    @Param('schoolId') schoolId: string,
+    @Param('subjectId') subjectId: string,
+  ) {
+    return this.schoolsService.deleteSchoolSubject(schoolId, subjectId);
+  }
+
   // ============================================================================
   // STAFF & TEACHER PROVISIONING
   // ============================================================================
 
   @Get(':schoolId/staff')
+  @UseGuards(TenantGuard)
   getStaff(@Param('schoolId') schoolId: string) {
     return this.schoolsService.getSchoolStaff(schoolId);
+  }
+
+  @Get(':schoolId/staff/:staffId')
+  @UseGuards(TenantGuard)
+  getStaffDetails(
+    @Param('schoolId') schoolId: string,
+    @Param('staffId') staffId: string,
+  ) {
+    return this.schoolsService.getSchoolStaffDetails(schoolId, staffId);
   }
 
   @Post(':schoolId/staff')
@@ -131,16 +292,54 @@ export class SchoolsController {
     @Body()
     dto: {
       fullName: string;
-      staffId: string;
+      staffId?: string;
       email?: string;
       title?: string;
       departmentId?: string;
       specialization?: string;
+      educationLevel?: string;
+      qualificationDetails?: string;
+      phoneNumber?: string;
+      gender?: string;
+      address?: string;
+      employmentType?: string;
+      yearsOfExperience?: number | string | null;
+      dateHired?: string;
+      handlesAllSubjects?: boolean;
+      formClassIds?: string[];
       assignedClassIds?: string[];
       assignedSubjectIds?: string[];
     },
   ) {
     return this.schoolsService.createSchoolStaff(schoolId, dto);
+  }
+
+  @Patch(':schoolId/staff/:staffId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('UPDATE_STAFF', 'TeacherProfile')
+  updateStaff(
+    @Param('schoolId') schoolId: string,
+    @Param('staffId') staffId: string,
+    @Body()
+    dto: {
+      fullName?: string;
+      email?: string;
+      title?: string;
+      departmentId?: string | null;
+      specialization?: string | null;
+      educationLevel?: string | null;
+      qualificationDetails?: string | null;
+      phoneNumber?: string | null;
+      gender?: string | null;
+      address?: string | null;
+      employmentType?: string | null;
+      yearsOfExperience?: number | string | null;
+      dateHired?: string | null;
+      handlesAllSubjects?: boolean;
+    },
+  ) {
+    return this.schoolsService.updateSchoolStaff(schoolId, staffId, dto);
   }
 
   @Post(':schoolId/staff/:staffId/assignments')
@@ -150,7 +349,13 @@ export class SchoolsController {
   assignTeacherCourses(
     @Param('schoolId') schoolId: string,
     @Param('staffId') staffId: string,
-    @Body() dto: { classIds?: string[]; subjectIds?: string[] },
+    @Body()
+    dto: {
+      classIds?: string[];
+      subjectIds?: string[];
+      formClassIds?: string[];
+      handlesAllSubjects?: boolean;
+    },
   ) {
     return this.schoolsService.assignTeacherCourses(schoolId, staffId, dto);
   }
@@ -160,6 +365,7 @@ export class SchoolsController {
   // ============================================================================
 
   @Get(':schoolId/students')
+  @UseGuards(TenantGuard)
   getStudents(
     @Param('schoolId') schoolId: string,
     @Query('departmentId') departmentId?: string,
@@ -186,14 +392,44 @@ export class SchoolsController {
     @Body()
     dto: {
       fullName: string;
-      matricOrAdmissionNo: string;
+      matricOrAdmissionNo?: string;
       email?: string;
       departmentId?: string;
       classId?: string;
       level?: string;
+      age?: number | string | null;
+      guardianName?: string;
+      guardianRelationship?: string;
+      guardianEmail?: string;
+      guardianPhone?: string;
     },
   ) {
     return this.schoolsService.createSchoolStudent(schoolId, dto);
+  }
+
+  @Patch(':schoolId/students/:studentProfileId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('UPDATE_STUDENT', 'StudentProfile')
+  updateStudent(
+    @Param('schoolId') schoolId: string,
+    @Param('studentProfileId') studentProfileId: string,
+    @Body()
+    dto: {
+      fullName?: string;
+      matricOrAdmissionNo?: string;
+      email?: string;
+      classId?: string | null;
+      departmentId?: string | null;
+      level?: string;
+      age?: number | string | null;
+      guardianName?: string | null;
+      guardianRelationship?: string | null;
+      guardianEmail?: string | null;
+      guardianPhone?: string | null;
+    },
+  ) {
+    return this.schoolsService.updateSchoolStudent(schoolId, studentProfileId, dto);
   }
 
   @Patch(':schoolId/students/:studentProfileId/assignment')

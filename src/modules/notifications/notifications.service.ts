@@ -60,8 +60,19 @@ export class NotificationsService {
     isRead: boolean;
     createdAt: Date;
   }) {
+    const dataObj =
+      n.dataJson && typeof n.dataJson === 'object' && !Array.isArray(n.dataJson)
+        ? (n.dataJson as Record<string, unknown>)
+        : {};
+
     return {
       ...n,
+      data: {
+        ...dataObj,
+        route:
+          n.deepLink ||
+          (typeof dataObj.route === 'string' ? dataObj.route : null),
+      },
       user_id: n.userId,
       school_id: n.schoolId,
       deep_link: n.deepLink,

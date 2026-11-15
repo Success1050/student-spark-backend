@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -13,6 +14,8 @@ import type {
   SaveGradeEntryInput,
   UpsertConfigInput,
 } from './assessments-grading.service.js';
+import { LiveRankingsService } from './live-rankings.service.js';
+import type { LiveRankingScope } from './live-rankings.service.js';
 import { Roles } from '../../common/decorators/roles.decorator.js';
 import { UserId } from '../../common/decorators/user-id.decorator.js';
 import { AuditAction } from '../../common/decorators/audit-action.decorator.js';
@@ -22,7 +25,36 @@ import { TeacherClassScopeGuard } from '../../common/guards/teacher-class-scope.
 @Controller(['assessments-grading', 'api/assessments-grading'])
 @UseGuards(RolesGuard, TeacherClassScopeGuard)
 export class AssessmentsGradingController {
-  constructor(private readonly gradingService: AssessmentsGradingService) {}
+  constructor(
+    private readonly gradingService: AssessmentsGradingService,
+    private readonly liveRankingsService: LiveRankingsService,
+  ) {}
+
+  @Get('schools/:schoolId/live-rankings')
+  @Roles('STUDENT', 'TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  getLiveRankings(
+    @UserId() userId: string,
+    @Param('schoolId') schoolId: string,
+    @Query('scope') scope?: LiveRankingScope,
+    @Query('termId') termId?: string,
+    @Query('sessionId') sessionId?: string,
+    @Query('classId') classId?: string,
+    @Query('combinedKey') combinedKey?: string,
+    @Query('subjectId') subjectId?: string,
+    @Query('departmentId') departmentId?: string,
+    @Query('unitId') unitId?: string,
+  ) {
+    return this.liveRankingsService.getLiveRankings(userId, schoolId, {
+      scope,
+      termId,
+      sessionId,
+      classId,
+      combinedKey,
+      subjectId,
+      departmentId,
+      unitId,
+    });
+  }
 
   @Get('schools/:schoolId/terms')
   @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN', 'STUDENT')
@@ -79,8 +111,121 @@ export class AssessmentsGradingController {
     @UserId() userId: string,
     @Param('schoolId') schoolId: string,
     @Param('termId') termId: string,
+    @Body() body?: { closePreviousCurrent?: boolean },
   ) {
-    return this.gradingService.setActiveTerm(userId, schoolId, termId);
+    return this.gradingService.setActiveTerm(
+      userId,
+      schoolId,
+      termId,
+      Boolean(body?.closePreviousCurrent),
+    );
+  }
+
+  @Patch('schools/:schoolId/terms/:termId/status')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('ACADEMIC_TERM_STATUS_UPDATED', 'AcademicTerm')
+  updateSchoolTermStatus(
+    @UserId() userId: string,
+    @Param('schoolId') schoolId: string,
+    @Param('termId') termId: string,
+    @Body() body: { isEnabled?: boolean; isClosed?: boolean },
+  ) {
+    return this.gradingService.updateTermStatus(userId, schoolId, termId, body);
+  }
+
+  @Get('schools/:schoolId/calendar')
+  @Roles('STUDENT', 'TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  getSchoolAcademicCalendar(
+    @UserId() userId: string,
+    @Param('schoolId') schoolId: string,
+    @Query('termId') termId?: string,
+  ) {
+    return this.gradingService.getSchoolAcademicCalendar(
+      userId,
+      schoolId,
+      termId,
+    );
+  }
+
+  @Patch('schools/:schoolId/terms/:termId/dates')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('ACADEMIC_TERM_DATES_UPDATED', 'AcademicTerm')
+  updateTermCalendarDates(
+    @UserId() userId: string,
+    @Param('schoolId') schoolId: string,
+    @Param('termId') termId: string,
+    @Body()
+    body: {
+      startDate?: string | null;
+      endDate?: string | null;
+      nextTermResumesDate?: string | null;
+    },
+  ) {
+    return this.gradingService.updateTermCalendarDates(
+      userId,
+      schoolId,
+      termId,
+      body,
+    );
+  }
+
+  @Post('schools/:schoolId/terms/:termId/calendar-events')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('CALENDAR_EVENT_CREATED', 'SchoolCalendarEvent')
+  createCalendarEvent(
+    @UserId() userId: string,
+    @Param('schoolId') schoolId: string,
+    @Param('termId') termId: string,
+    @Body()
+    body: {
+      title: string;
+      type?: 'HOLIDAY' | 'MID_TERM' | 'OTHER';
+      startDate: string;
+      endDate?: string;
+      description?: string;
+    },
+  ) {
+    return this.gradingService.createCalendarEvent(
+      userId,
+      schoolId,
+      termId,
+      body,
+    );
+  }
+
+  @Patch('schools/:schoolId/calendar-events/:eventId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('CALENDAR_EVENT_UPDATED', 'SchoolCalendarEvent')
+  updateCalendarEvent(
+    @UserId() userId: string,
+    @Param('schoolId') schoolId: string,
+    @Param('eventId') eventId: string,
+    @Body()
+    body: {
+      title?: string;
+      type?: 'HOLIDAY' | 'MID_TERM' | 'OTHER';
+      startDate?: string;
+      endDate?: string;
+      description?: string | null;
+    },
+  ) {
+    return this.gradingService.updateCalendarEvent(
+      userId,
+      schoolId,
+      eventId,
+      body,
+    );
+  }
+
+  @Delete('schools/:schoolId/calendar-events/:eventId')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('CALENDAR_EVENT_DELETED', 'SchoolCalendarEvent')
+  deleteCalendarEvent(
+    @UserId() userId: string,
+    @Param('schoolId') schoolId: string,
+    @Param('eventId') eventId: string,
+  ) {
+    return this.gradingService.deleteCalendarEvent(userId, schoolId, eventId);
   }
 
   @Get('schools/:schoolId/config')
@@ -240,6 +385,42 @@ export class AssessmentsGradingController {
       userId,
       classId,
       body || {},
+    );
+  }
+
+  @Get('classes/:classId/traits')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  getClassTraits(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Query('termId') termId?: string,
+  ) {
+    return this.gradingService.getClassTraitRatings(userId, classId, termId);
+  }
+
+  @Patch('classes/:classId/students/:studentId/traits')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('STUDENT_TRAITS_UPDATED', 'TerminalReportCard')
+  updateStudentTraits(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Param('studentId') studentId: string,
+    @Body()
+    body: {
+      termId?: string;
+      ratings: Record<string, string>;
+      daysPresent?: number | null;
+      daysLate?: number | null;
+      daysAbsent?: number | null;
+      daysExcused?: number | null;
+      teacherRemark?: string | null;
+    },
+  ) {
+    return this.gradingService.updateStudentTraitRatings(
+      userId,
+      classId,
+      studentId,
+      body,
     );
   }
 

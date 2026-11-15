@@ -94,6 +94,20 @@ export class TeacherController {
   }
 
   /**
+   * GET /teacher/roster/:studentId/record
+   * Comprehensive sectioned & tabbed student academic record
+   */
+  @Get('roster/:studentId/record')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  getStudentRecord(
+    @UserId() userId: string,
+    @Param('studentId') studentId: string,
+    @Query('termId') termId?: string,
+  ) {
+    return this.teacherService.getStudentDetailedRecord(userId, studentId, termId);
+  }
+
+  /**
    * GET /teacher/notes
    */
   @Get('notes')

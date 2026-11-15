@@ -28,7 +28,7 @@ export class StorageService {
       const uploadStream = cloudinary.uploader.upload_stream(
         {
           folder: `studentspark/${folder}`,
-          public_id: fileName.replace(/\.[^/.]+$/, ''),
+          public_id: fileName,
           resource_type: 'raw',
         },
         (error, result) => {

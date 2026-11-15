@@ -10,6 +10,11 @@ import { PrismaService } from '../../database/prisma.service.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
 import { StorageService } from '../storage/storage.service.js';
 import { OpenAiService } from '../ai/services/openai.service.js';
+import { AssessmentsGradingService } from '../assessments-grading/assessments-grading.service.js';
+import {
+  getDefaultTraitsConfig,
+  normalizeStudentTraitRatings,
+} from '../assessments-grading/calculators/report-card-traits.helper.js';
 
 @Injectable()
 export class TeacherService {
@@ -18,6 +23,7 @@ export class TeacherService {
     private readonly notificationsService: NotificationsService,
     private readonly storage: StorageService,
     private readonly openAiService: OpenAiService,
+    private readonly gradingService: AssessmentsGradingService,
   ) {}
 
   /**
@@ -119,6 +125,9 @@ export class TeacherService {
       },
     });
 
+    const attendanceClasses = assignedClasses.filter((c) => c.canMarkAttendance);
+    const formClasses = assignedClasses.filter((c) => c.isFormTeacher);
+
     return {
       teacherProfile: {
         ...profile,
@@ -127,6 +136,10 @@ export class TeacherService {
       stats: {
         coursesCount: assignedCourses.length,
         classesCount: assignedClasses.length,
+        attendanceClassesCount: attendanceClasses.length,
+        formClassesCount: formClasses.length,
+        assignedClassNames: assignedClasses.map((c) => c.name),
+        attendanceClassNames: attendanceClasses.map((c) => c.name),
         studentsCount,
         notesCount,
         cbtCount,
@@ -196,6 +209,16 @@ export class TeacherService {
     return updatedProfile;
   }
 
+  private isTertiaryInstitution(institutionType?: string | null): boolean {
+    const t = String(institutionType || '').toUpperCase();
+    return (
+      t === 'UNIVERSITY' ||
+      t === 'POLYTECHNIC' ||
+      t === 'COLLEGE_OF_EDUCATION' ||
+      t === 'TECHNICAL'
+    );
+  }
+
   /**
    * 4. GET /teacher/courses
    * Returns subjects/courses assigned to this teacher with student counts
@@ -203,13 +226,22 @@ export class TeacherService {
   async getAssignedCourses(userId: string) {
     const profile = await this.prisma.teacherProfile.findFirst({
       where: { userId },
+      include: {
+        assignedClasses: { select: { id: true } },
+      },
     });
+
+    const fullClassIds =
+      profile?.handlesAllSubjects
+        ? profile.assignedClasses.map((c) => c.id)
+        : [];
 
     const subjects = await this.prisma.schoolSubject.findMany({
       where: {
         OR: [
           { teacherId: userId },
           ...(profile ? [{ assignedTeachers: { some: { id: profile.id } } }] : []),
+          ...(fullClassIds.length > 0 ? [{ classId: { in: fullClassIds } }] : []),
         ],
       },
       include: {
@@ -234,46 +266,56 @@ export class TeacherService {
           },
         },
       },
-      orderBy: { courseCode: 'asc' },
+      orderBy: [{ schoolClass: { name: 'asc' } }, { name: 'asc' }],
     });
 
-    // Also get student counts per course class
-    const coursesWithStudents = await Promise.all(
-      subjects.map(async (subj) => {
-        const studentCount = await this.prisma.studentProfile.count({
-          where: { classId: subj.classId },
+    // Also get student counts per course class (cached per classId)
+    const countMap = new Map<string, number>();
+    const uniqueClassIds = Array.from(new Set(subjects.map((s) => s.classId)));
+    await Promise.all(
+      uniqueClassIds.map(async (cid) => {
+        const cnt = await this.prisma.studentProfile.count({
+          where: { classId: cid },
         });
-
-        return {
-          id: subj.id,
-          name: subj.name,
-          courseCode: subj.courseCode,
-          creditUnits: subj.creditUnits,
-          minAttendancePercent: subj.minAttendancePercent,
-          classId: subj.classId,
-          className: subj.schoolClass.name,
-          levelCode: subj.schoolClass.levelCode,
-          departmentId: subj.departmentId,
-          departmentName: subj.department?.name || 'General',
-          departmentCode: subj.department?.code || '',
-          notesCount: subj._count.notes,
-          quizzesCount: subj._count.quizzes,
-          enrolledStudentsCount: studentCount,
-        };
+        countMap.set(cid, cnt);
       }),
     );
 
-    return coursesWithStudents;
+    return subjects.map((subj) => ({
+      id: subj.id,
+      name: subj.name,
+      courseCode: subj.courseCode,
+      creditUnits: subj.creditUnits,
+      minAttendancePercent: subj.minAttendancePercent,
+      classId: subj.classId,
+      className: subj.schoolClass.name,
+      levelCode: subj.schoolClass.levelCode,
+      departmentId: subj.departmentId,
+      departmentName: subj.department?.name || 'General',
+      departmentCode: subj.department?.code || '',
+      notesCount: subj._count.notes,
+      quizzesCount: subj._count.quizzes,
+      enrolledStudentsCount: countMap.get(subj.classId) || 0,
+    }));
   }
 
   /**
    * 5. GET /teacher/classes
-   * Returns classes assigned to this teacher (as form teacher or subject instructor)
+   * Returns classes assigned to this teacher (as form teacher, full-class teacher, or subject instructor)
    */
   async getAssignedClasses(userId: string) {
     const profile = await this.prisma.teacherProfile.findFirst({
       where: { userId },
+      include: {
+        school: { select: { institutionType: true } },
+        assignedClasses: { select: { id: true } },
+      },
     });
+
+    const assignedClassIdSet = new Set(
+      (profile?.assignedClasses || []).map((c) => c.id),
+    );
+    const isTertiary = this.isTertiaryInstitution(profile?.school?.institutionType);
 
     const classes = await this.prisma.schoolClass.findMany({
       where: {
@@ -301,17 +343,14 @@ export class TeacherService {
           },
         },
         subjects: {
-          where: {
-            OR: [
-              { teacherId: userId },
-              ...(profile ? [{ assignedTeachers: { some: { id: profile.id } } }] : []),
-            ],
-          },
           select: {
             id: true,
             name: true,
             courseCode: true,
+            teacherId: true,
+            assignedTeachers: { select: { id: true } },
           },
+          orderBy: { name: 'asc' },
         },
         _count: {
           select: {
@@ -322,17 +361,46 @@ export class TeacherService {
       orderBy: { name: 'asc' },
     });
 
-    return classes.map((c) => ({
-      id: c.id,
-      name: c.name,
-      levelCode: c.levelCode,
-      termOrSemester: c.termOrSemester,
-      departmentId: c.departmentId,
-      departmentName: c.department?.name || 'General',
-      isFormTeacher: c.formTeacherId === userId,
-      studentCount: c._count.studentProfiles,
-      assignedSubjects: c.subjects,
-    }));
+    return classes.map((c) => {
+      const isFormTeacher = c.formTeacherId === userId;
+      const isFullClassTeacher = Boolean(
+        profile?.handlesAllSubjects && assignedClassIdSet.has(c.id),
+      );
+
+      const effectiveSubjects = isFullClassTeacher
+        ? c.subjects.map((s) => ({
+            id: s.id,
+            name: s.name,
+            courseCode: s.courseCode,
+          }))
+        : c.subjects
+            .filter(
+              (s) =>
+                s.teacherId === userId ||
+                (profile && s.assignedTeachers.some((t) => t.id === profile.id)),
+            )
+            .map((s) => ({
+              id: s.id,
+              name: s.name,
+              courseCode: s.courseCode,
+            }));
+
+      return {
+        id: c.id,
+        name: c.name,
+        levelCode: c.levelCode,
+        termOrSemester: c.termOrSemester,
+        minAttendancePercent: c.minAttendancePercent ?? 75,
+        departmentId: c.departmentId,
+        departmentName: c.department?.name || 'General',
+        isFormTeacher,
+        handlesAllSubjects: isFullClassTeacher,
+        canMarkAttendance: isTertiary ? true : isFormTeacher,
+        studentCount: c._count.studentProfiles,
+        totalClassSubjectsCount: c.subjects.length,
+        assignedSubjects: effectiveSubjects,
+      };
+    });
   }
 
   /**
@@ -430,9 +498,465 @@ export class TeacherService {
       className: s.schoolClass?.name || 'Class',
       levelCode: s.schoolClass?.levelCode || s.level || '100L',
       departmentName: s.department?.name || 'General',
+      age: (s as any).age ?? null,
+      guardianName: (s as any).guardianName ?? null,
+      guardianRelationship: (s as any).guardianRelationship ?? null,
+      guardianEmail: (s as any).guardianEmail ?? null,
+      guardianPhone: (s as any).guardianPhone ?? null,
       cgpa: s.cgpa,
       totalCredits: s.totalCredits,
     }));
+  }
+
+  /**
+   * 6b. GET /teacher/roster/:studentId/record
+   * Comprehensive sectioned & tabbed academic record (Overview, Subjects, Attendance, Traits & Remarks)
+   */
+  async getStudentDetailedRecord(
+    requesterUserId: string,
+    studentProfileOrUserId: string,
+    termId?: string,
+  ) {
+    const requester = await this.prisma.user.findUnique({
+      where: { id: requesterUserId },
+      select: { id: true, role: true, schoolId: true },
+    });
+    if (!requester) {
+      throw new ForbiddenException('Account not found.');
+    }
+
+    const profile = await this.prisma.studentProfile.findFirst({
+      where: {
+        OR: [
+          { id: studentProfileOrUserId },
+          { userId: studentProfileOrUserId },
+        ],
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            avatarUrl: true,
+            studentCode: true,
+            loginId: true,
+            createdAt: true,
+          },
+        },
+        school: {
+          select: {
+            id: true,
+            name: true,
+            schoolCode: true,
+            institutionType: true,
+            logoUrl: true,
+            primaryColor: true,
+          },
+        },
+        department: {
+          select: {
+            id: true,
+            name: true,
+            code: true,
+            unit: { select: { id: true, name: true, code: true } },
+          },
+        },
+        schoolClass: {
+          select: {
+            id: true,
+            name: true,
+            levelCode: true,
+            inviteCode: true,
+            termOrSemester: true,
+            formTeacherId: true,
+            subjects: {
+              include: {
+                teacher: { select: { id: true, fullName: true } },
+              },
+              orderBy: { name: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!profile) {
+      throw new NotFoundException('Student academic profile not found.');
+    }
+
+    const isAdmin =
+      requester.role === 'SCHOOL_ADMIN' || requester.role === 'SUPER_ADMIN';
+    if (isAdmin) {
+      if (
+        requester.role === 'SCHOOL_ADMIN' &&
+        requester.schoolId &&
+        requester.schoolId !== profile.schoolId
+      ) {
+        throw new ForbiddenException(
+          'Student belongs to a different institution.',
+        );
+      }
+    } else {
+      const teacher = await this.prisma.teacherProfile.findFirst({
+        where: { userId: requesterUserId },
+        select: { id: true, schoolId: true },
+      });
+      if (!teacher || teacher.schoolId !== profile.schoolId) {
+        throw new ForbiddenException('Access denied for this student record.');
+      }
+      if (profile.classId) {
+        const hasAccess = await this.prisma.schoolClass.findFirst({
+          where: {
+            id: profile.classId,
+            OR: [
+              { formTeacherId: requesterUserId },
+              { teacherProfiles: { some: { id: teacher.id } } },
+              {
+                subjects: {
+                  some: {
+                    OR: [
+                      { teacherId: requesterUserId },
+                      { assignedTeachers: { some: { id: teacher.id } } },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+          select: { id: true },
+        });
+        if (!hasAccess) {
+          throw new ForbiddenException(
+            'You are not assigned to this student’s class or subjects.',
+          );
+        }
+      }
+    }
+
+    const instUpper = String(profile.school?.institutionType || '').toUpperCase();
+    const isTertiary =
+      instUpper.includes('UNIV') ||
+      instUpper.includes('POLY') ||
+      instUpper.includes('COLLEG') ||
+      instUpper.includes('TERT');
+
+    const [terms, sessions] = await Promise.all([
+      this.prisma.academicTerm.findMany({
+        where: { session: { schoolId: profile.schoolId } },
+        orderBy: [{ isCurrent: 'desc' }, { startDate: 'desc' }, { createdAt: 'desc' }],
+        select: {
+          id: true,
+          name: true,
+          session: { select: { id: true, name: true, isCurrent: true } },
+          sessionId: true,
+          isCurrent: true,
+          startDate: true,
+          endDate: true,
+        },
+      }),
+      this.prisma.academicSession.findMany({
+        where: { schoolId: profile.schoolId },
+        orderBy: [{ isCurrent: 'desc' }, { createdAt: 'desc' }],
+        select: { id: true, name: true, isCurrent: true },
+      }),
+    ]);
+
+    const selectedTerm =
+      (termId ? terms.find((t) => t.id === termId) : null) ||
+      terms.find((t) => t.isCurrent) ||
+      terms[0] ||
+      null;
+
+    let reportCardData: any = null;
+    if (profile.classId && selectedTerm) {
+      try {
+        reportCardData = await this.gradingService.getStudentReportCardForClass(
+          requesterUserId,
+          profile.classId,
+          profile.userId,
+          selectedTerm.id,
+        );
+      } catch {
+        reportCardData = null;
+      }
+    }
+
+    const schoolConfigRec = await this.prisma.assessmentConfig.findFirst({
+      where: { schoolId: profile.schoolId, subjectId: null },
+      select: {
+        componentsJson: true,
+        gradeScaleJson: true,
+        traitsConfigJson: true,
+        reportCardMetaJson: true,
+        gpaScaleMax: true,
+      },
+    });
+
+    const sessionFilter: any = {
+      schoolId: profile.schoolId,
+      ...(profile.classId ? { classId: profile.classId } : {}),
+    };
+    if (selectedTerm?.startDate && selectedTerm?.endDate) {
+      sessionFilter.sessionDate = {
+        gte: selectedTerm.startDate,
+        lte: selectedTerm.endDate,
+      };
+    }
+
+    const attendanceSessions = profile.classId
+      ? await this.prisma.attendanceSession.findMany({
+          where: sessionFilter,
+          include: {
+            subject: {
+              select: {
+                id: true,
+                name: true,
+                courseCode: true,
+                minAttendancePercent: true,
+              },
+            },
+            records: {
+              where: { studentId: profile.userId },
+              select: { status: true, checkedInAt: true },
+            },
+          },
+          orderBy: { sessionDate: 'desc' },
+          take: 100,
+        })
+      : [];
+
+    let present = 0;
+    let late = 0;
+    let excused = 0;
+    let absent = 0;
+    const subjectAttendanceMap = new Map<
+      string,
+      { total: number; attended: number }
+    >();
+
+    const recentLogs = attendanceSessions.map((sess) => {
+      const rec = sess.records[0];
+      const status = rec?.status || 'ABSENT';
+      if (status === 'PRESENT') present += 1;
+      else if (status === 'LATE') late += 1;
+      else if (status === 'EXCUSED') excused += 1;
+      else absent += 1;
+
+      if (sess.subjectId && sess.subject) {
+        const cur = subjectAttendanceMap.get(sess.subjectId) || {
+          total: 0,
+          attended: 0,
+        };
+        cur.total += 1;
+        if (status === 'PRESENT' || status === 'LATE' || status === 'EXCUSED') {
+          cur.attended += 1;
+        }
+        subjectAttendanceMap.set(sess.subjectId, cur);
+      }
+
+      return {
+        sessionId: sess.id,
+        date: sess.sessionDate.toISOString(),
+        subjectId: sess.subject?.id || sess.classId,
+        subjectName: sess.subject?.name || 'Daily Class Register',
+        courseCode: sess.subject?.courseCode || 'CLASS',
+        status,
+      };
+    });
+
+    const totalSessions = attendanceSessions.length;
+    const attendedSessions = present + late + excused;
+    const attendancePercent =
+      totalSessions > 0
+        ? Math.round((attendedSessions / totalSessions) * 100)
+        : 100;
+
+    const classSubjects = profile.schoolClass?.subjects || [];
+    const gradedMap = new Map<string, any>(
+      (reportCardData?.subjectGrades || []).map((sg: any) => [sg.subjectId, sg]),
+    );
+
+    const subjects = classSubjects.map((subj) => {
+      const gradeRow = gradedMap.get(subj.id);
+      const subjAtt = subjectAttendanceMap.get(subj.id);
+      const subjAttPct =
+        subjAtt && subjAtt.total > 0
+          ? Math.round((subjAtt.attended / subjAtt.total) * 100)
+          : null;
+      return {
+        subjectId: subj.id,
+        name: subj.name,
+        courseCode: subj.courseCode,
+        creditUnits: subj.creditUnits,
+        teacherName: subj.teacher?.fullName || null,
+        minAttendancePercent: subj.minAttendancePercent,
+        attendancePercent: subjAttPct,
+        graded: Boolean(gradeRow),
+        scoresJson: gradeRow?.scoresJson || null,
+        totalScore: gradeRow?.totalScore ?? null,
+        classAverage: gradeRow?.classAverage ?? null,
+        letterGrade: gradeRow?.letterGrade ?? null,
+        gradePoint: gradeRow?.gradePoint ?? null,
+        subjectPosition: gradeRow?.subjectPosition ?? null,
+        subjectOrdinal: gradeRow?.subjectOrdinal ?? null,
+        teacherComment: gradeRow?.teacherComment ?? null,
+      };
+    });
+
+    const reportCardRaw =
+      profile.classId && selectedTerm
+        ? await this.prisma.terminalReportCard.findUnique({
+            where: {
+              termId_classId_studentId: {
+                termId: selectedTerm.id,
+                classId: profile.classId,
+                studentId: profile.userId,
+              },
+            },
+            select: {
+              traitRatingsJson: true,
+              teacherRemark: true,
+              principalRemark: true,
+              published: true,
+            },
+          })
+        : null;
+
+    const defaultTraits = getDefaultTraitsConfig(profile.school?.institutionType);
+    const traitsConfig =
+      reportCardData?.assessmentConfig?.traitsConfig ||
+      (schoolConfigRec?.traitsConfigJson as any) ||
+      defaultTraits;
+    const normalizedTraits = normalizeStudentTraitRatings(
+      reportCardData?.traitRatings ?? reportCardRaw?.traitRatingsJson,
+    );
+    const totalTraitsCount = (traitsConfig.categories || []).reduce(
+      (sum: number, cat: any) => sum + (cat.items?.length || 0),
+      0,
+    );
+    const ratedTraitsCount = Object.keys(normalizedTraits.ratings || {}).length;
+
+    const thresholdPercent = classSubjects[0]?.minAttendancePercent ?? 75;
+    const examEligible = attendancePercent >= thresholdPercent;
+
+    return {
+      school: {
+        id: profile.school.id,
+        name: profile.school.name,
+        schoolCode: profile.school.schoolCode,
+        institutionType: profile.school.institutionType,
+        isTertiary,
+        gpaScaleMax:
+          reportCardData?.gpaScaleMax ?? schoolConfigRec?.gpaScaleMax ?? 5.0,
+        logoUrl: profile.school.logoUrl,
+        primaryColor: profile.school.primaryColor,
+      },
+      student: {
+        id: profile.id,
+        userId: profile.userId,
+        fullName: profile.user.fullName || 'Student',
+        email: profile.user.email,
+        avatarUrl: profile.user.avatarUrl,
+        matricOrAdmissionNo:
+          profile.matricOrAdmissionNo || profile.user.loginId || 'N/A',
+        studentCode: profile.user.studentCode,
+        loginId: profile.user.loginId,
+        classId: profile.classId,
+        className: profile.schoolClass?.name || 'Unassigned',
+        levelCode: profile.schoolClass?.levelCode || profile.level || null,
+        departmentId: profile.departmentId,
+        departmentName: profile.department?.name || 'General',
+        unitName: profile.department?.unit?.name || null,
+        age: (profile as any).age ?? null,
+        guardianName: (profile as any).guardianName ?? null,
+        guardianRelationship: (profile as any).guardianRelationship ?? null,
+        guardianEmail: (profile as any).guardianEmail ?? null,
+        guardianPhone: (profile as any).guardianPhone ?? null,
+        enrolledAt: profile.createdAt.toISOString(),
+        userCreatedAt: profile.user.createdAt.toISOString(),
+        cgpa: reportCardData?.summary?.cgpa ?? profile.cgpa,
+        totalCredits:
+          reportCardData?.summary?.cumulativeUnits ?? profile.totalCredits,
+      },
+      term: selectedTerm
+        ? {
+            id: selectedTerm.id,
+            name: selectedTerm.name,
+            session: selectedTerm.session?.name || '',
+            sessionId: selectedTerm.sessionId,
+            isCurrent: selectedTerm.isCurrent,
+          }
+        : null,
+      terms: terms.map((t) => ({
+        id: t.id,
+        name: t.name,
+        session: t.session?.name || '',
+        sessionId: t.sessionId,
+        isCurrent: t.isCurrent,
+      })),
+      sessions,
+      assessmentConfig: reportCardData?.assessmentConfig || {
+        components: schoolConfigRec?.componentsJson || [],
+        gradeScale: schoolConfigRec?.gradeScaleJson || [],
+        traitsConfig,
+        reportCardMeta: schoolConfigRec?.reportCardMetaJson || null,
+      },
+      summary: {
+        totalScore: reportCardData?.summary?.totalScore ?? 0,
+        overallAverage: reportCardData?.summary?.overallAverage ?? 0,
+        overallPosition: reportCardData?.summary?.overallPosition ?? null,
+        overallOrdinal: reportCardData?.summary?.overallOrdinal ?? null,
+        totalInClass: reportCardData?.schoolClass?.totalStudents ?? null,
+        classAverage: reportCardData?.schoolClass?.classAverage ?? null,
+        gpa: reportCardData?.summary?.gpa ?? 0,
+        cgpa: reportCardData?.summary?.cgpa ?? profile.cgpa ?? 0,
+        termUnits: reportCardData?.summary?.termUnits ?? 0,
+        cumulativeUnits:
+          reportCardData?.summary?.cumulativeUnits ?? profile.totalCredits ?? 0,
+        standing: reportCardData?.summary?.standing ?? null,
+        teacherRemark:
+          reportCardData?.summary?.teacherRemark ??
+          reportCardRaw?.teacherRemark ??
+          null,
+        principalRemark:
+          reportCardData?.summary?.principalRemark ??
+          reportCardRaw?.principalRemark ??
+          null,
+        published:
+          reportCardData?.summary?.published ??
+          reportCardRaw?.published ??
+          false,
+        gradedCount: subjects.filter((s) => s.graded).length,
+        totalSubjectsCount: subjects.length,
+      },
+      subjects,
+      attendance: {
+        overallPercent: attendancePercent,
+        examEligible,
+        thresholdPercent,
+        daysPresent: normalizedTraits.daysPresent ?? null,
+        daysSchoolOpened:
+          reportCardData?.assessmentConfig?.reportCardMeta?.daysSchoolOpened ??
+          (schoolConfigRec?.reportCardMetaJson as any)?.daysSchoolOpened ??
+          null,
+        counts: {
+          totalSessions,
+          present,
+          late,
+          excused,
+          absent,
+        },
+        recentLogs: recentLogs.slice(0, 15),
+      },
+      traits: {
+        config: traitsConfig,
+        ratings: normalizedTraits.ratings || {},
+        daysPresent: normalizedTraits.daysPresent ?? null,
+        ratedCount: ratedTraitsCount,
+        totalTraitsCount,
+      },
+    };
   }
 
   /**
@@ -590,41 +1114,41 @@ export class TeacherService {
       select: { fullName: true },
     });
 
-    // Mirror to E-Library Class Handouts shelf so students can also find it under Class Handouts
+    // Always mirror created class notes to E-Library Class Handouts shelf
     let mirroredToClassHandouts = false;
-    if (payload.alsoPostToClassHandouts !== false) {
-      try {
-        await this.prisma.marketplaceItem.create({
-          data: {
-            sellerId: userId,
-            schoolId: profile.schoolId,
-            classId: payload.classId,
-            subjectId: payload.subjectId,
-            title: payload.title.trim(),
-            description: resolvedSummary,
-            authorName:
-              profile.title && teacherUser?.fullName && !teacherUser.fullName.toLowerCase().startsWith(profile.title.toLowerCase())
-                ? `${profile.title} ${teacherUser.fullName}`
-                : teacherUser?.fullName || 'Course Lecturer',
-            courseCode: payload.courseCode || subject.courseCode,
-            institutionType: profile.school?.institutionType || 'SECONDARY',
-            priceKobo: 0,
-            isFree: true,
-            encryptedFileUrl: resolvedFileUrl || `class-note://${note.id}`,
-            status: MarketplaceItemStatus.APPROVED,
-            visibilityScope: 'COURSE_OR_CLASS',
-            format: resolvedFormat,
-            fileSize: payload.fileSize || null,
-            pageCount: 1,
-            departmentName: profile.department?.name || null,
-            levelName: subject.schoolClass?.levelCode || null,
-            termOrSemester: subject.schoolClass?.termOrSemester || null,
-          },
-        });
-        mirroredToClassHandouts = true;
-      } catch (err) {
-        console.warn('Could not mirror note to marketplace item:', err);
-      }
+    let mirroredBookId: string | null = null;
+    try {
+      const mirroredItem = await this.prisma.marketplaceItem.create({
+        data: {
+          sellerId: userId,
+          schoolId: profile.schoolId,
+          classId: payload.classId,
+          subjectId: payload.subjectId,
+          title: payload.title.trim(),
+          description: resolvedSummary,
+          authorName:
+            profile.title && teacherUser?.fullName && !teacherUser.fullName.toLowerCase().startsWith(profile.title.toLowerCase())
+              ? `${profile.title} ${teacherUser.fullName}`
+              : teacherUser?.fullName || 'Course Lecturer',
+          courseCode: payload.courseCode || subject.courseCode,
+          institutionType: profile.school?.institutionType || 'SECONDARY',
+          priceKobo: 0,
+          isFree: true,
+          encryptedFileUrl: resolvedFileUrl || `class-note://${note.id}`,
+          status: MarketplaceItemStatus.APPROVED,
+          visibilityScope: 'COURSE_OR_CLASS',
+          format: resolvedFormat,
+          fileSize: payload.fileSize || null,
+          pageCount: 1,
+          departmentName: profile.department?.name || null,
+          levelName: subject.schoolClass?.levelCode || null,
+          termOrSemester: subject.schoolClass?.termOrSemester || null,
+        },
+      });
+      mirroredToClassHandouts = true;
+      mirroredBookId = mirroredItem.id;
+    } catch (err) {
+      console.warn('Could not mirror note to marketplace item:', err);
     }
 
     // Notify students of this class
@@ -641,7 +1165,9 @@ export class TeacherService {
           title: `📚 New Class Note: ${note.title}`,
           body: `${teacherUser?.fullName || 'Your lecturer'} shared a new handout for ${note.courseCode}.`,
           category: 'SCHOOL',
-          deepLink: `/notesDetails?noteId=${note.id}`,
+          deepLink: mirroredBookId
+            ? `/ebookReader?bookId=${mirroredBookId}`
+            : `/notesDetails?id=${note.id}`,
         })
         .catch(() => {});
     }

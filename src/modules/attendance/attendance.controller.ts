@@ -119,8 +119,89 @@ export class AttendanceController {
   }
 
   /**
+   * ============================================================================
+   * CLASS-LEVEL ATTENDANCE (Nursery / Primary / Secondary Form Teachers)
+   * ============================================================================
+   */
+
+  @Get('classes/:classId/summary')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN', 'STUDENT')
+  getClassSummary(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Query('threshold') threshold?: string,
+    @Query('date') date?: string,
+    @Query('termId') termId?: string,
+  ) {
+    return this.attendanceService.getClassAttendanceSummary(
+      classId,
+      threshold ? Number(threshold) : undefined,
+      userId,
+      date,
+      termId,
+    );
+  }
+
+  @Get('classes/:classId/sessions/:sessionId/detail')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  getClassDailySessionDetail(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Param('sessionId') sessionId: string,
+  ) {
+    return this.attendanceService.getClassDailySessionDetail(
+      userId,
+      classId,
+      sessionId,
+    );
+  }
+
+  @Get('classes/:classId/report')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  getClassTermReport(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Query('termId') termId?: string,
+  ) {
+    return this.attendanceService.getClassTermAttendanceReport(
+      userId,
+      classId,
+      termId,
+    );
+  }
+
+  @Get('classes/:classId/students/:studentId')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  getClassStudentDetail(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Param('studentId') studentId: string,
+  ) {
+    return this.attendanceService.getClassStudentAttendanceDetail(
+      userId,
+      classId,
+      studentId,
+    );
+  }
+
+  @Patch('classes/:classId/threshold')
+  @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('CLASS_ATTENDANCE_THRESHOLD_UPDATED', 'SchoolClass')
+  updateClassThreshold(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Body() body: { minAttendancePercent: number },
+  ) {
+    return this.attendanceService.updateClassThreshold(
+      userId,
+      classId,
+      body.minAttendancePercent,
+    );
+  }
+
+  /**
    * POST /attendance/sessions/pin
-   * Generate a 5-minute 4-digit Lecture PIN for student classroom check-in
+   * Generate a 5-minute 4-digit Lecture/Class PIN for student classroom check-in
    */
   @Post('sessions/pin')
   @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
@@ -129,7 +210,8 @@ export class AttendanceController {
     @UserId() userId: string,
     @Body()
     body: {
-      subjectId: string;
+      subjectId?: string;
+      classId?: string;
       durationMinutes?: number;
       sessionId?: string;
     },
@@ -139,7 +221,7 @@ export class AttendanceController {
 
   /**
    * POST /attendance/sessions/roll-call
-   * Teacher 1-tap bulk roll-call logging for an AttendanceSession
+   * Teacher 1-tap bulk roll-call logging for an AttendanceSession (subject or class)
    */
   @Post('sessions/roll-call')
   @Roles('TEACHER', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
@@ -148,7 +230,8 @@ export class AttendanceController {
     @UserId() userId: string,
     @Body()
     body: {
-      subjectId: string;
+      subjectId?: string;
+      classId?: string;
       sessionId?: string;
       sessionDate?: string;
       startNewSession?: boolean;

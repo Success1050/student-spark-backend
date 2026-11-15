@@ -47,8 +47,9 @@ export class TeacherClassScopeGuard implements CanActivate {
       return true;
     }
 
+    const userId = user.id || user.sub;
     const teacherProfile = await this.prisma.teacherProfile.findFirst({
-      where: { userId: user.id || user.sub },
+      where: { userId },
       include: {
         assignedClasses: { select: { id: true } },
         assignedSubjects: { select: { id: true } },
@@ -59,13 +60,13 @@ export class TeacherClassScopeGuard implements CanActivate {
       // Fallback: check legacy direct teacherId on subject or class formTeacherId
       const legacySubject = subjectId
         ? await this.prisma.schoolSubject.findFirst({
-            where: { id: subjectId, teacherId: user.id || user.sub },
+            where: { id: subjectId, teacherId: userId },
           })
         : null;
 
       const legacyClass = classId
         ? await this.prisma.schoolClass.findFirst({
-            where: { id: classId, formTeacherId: user.id || user.sub },
+            where: { id: classId, formTeacherId: userId },
           })
         : null;
 
@@ -77,23 +78,33 @@ export class TeacherClassScopeGuard implements CanActivate {
       return true;
     }
 
-    // Check class assignment
+    const assignedClassIds = teacherProfile.assignedClasses.map((c: any) => c.id);
+
+    // Check class assignment (direct assignment, form teacher, or teaching any subject in class)
     if (classId) {
-      const isClassAssigned =
-        teacherProfile.assignedClasses.some((c: any) => c.id === classId);
+      const isClassAssigned = assignedClassIds.includes(classId);
       if (!isClassAssigned) {
-        // Also check if teacher has any subject in that class
-        const hasSubjectInClass = await this.prisma.schoolSubject.findFirst({
+        const hasClassAccess = await this.prisma.schoolClass.findFirst({
           where: {
-            classId,
+            id: classId,
             OR: [
-              { teacherId: user.id || user.sub },
-              { assignedTeachers: { some: { id: teacherProfile.id } } },
+              { formTeacherId: userId },
+              {
+                subjects: {
+                  some: {
+                    OR: [
+                      { teacherId: userId },
+                      { assignedTeachers: { some: { id: teacherProfile.id } } },
+                    ],
+                  },
+                },
+              },
             ],
           },
+          select: { id: true },
         });
 
-        if (!hasSubjectInClass) {
+        if (!hasClassAccess) {
           throw new ForbiddenException(
             'Access denied: You are not assigned to this class or level cohort.',
           );
@@ -101,16 +112,23 @@ export class TeacherClassScopeGuard implements CanActivate {
       }
     }
 
-    // Check subject/course assignment
+    // Check subject/course assignment (explicit subject, legacy owner, or handlesAllSubjects in an assigned class)
     if (subjectId) {
       const isSubjectAssigned =
         teacherProfile.assignedSubjects.some((s: any) => s.id === subjectId);
       if (!isSubjectAssigned) {
-        const isLegacySubject = await this.prisma.schoolSubject.findFirst({
-          where: { id: subjectId, teacherId: user.id || user.sub },
+        const subjectRecord = await this.prisma.schoolSubject.findUnique({
+          where: { id: subjectId },
+          select: { id: true, classId: true, teacherId: true },
         });
 
-        if (!isLegacySubject) {
+        const isLegacySubject = subjectRecord?.teacherId === userId;
+        const isAllSubjectsClassTeacher =
+          Boolean(teacherProfile.handlesAllSubjects) &&
+          Boolean(subjectRecord?.classId) &&
+          assignedClassIds.includes(subjectRecord!.classId);
+
+        if (!isLegacySubject && !isAllSubjectsClassTeacher) {
           throw new ForbiddenException(
             'Access denied: You are not assigned to this course or subject.',
           );

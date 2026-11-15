@@ -13,12 +13,31 @@ export type RollCallEntryInput = {
   status: 'PRESENT' | 'ABSENT' | 'LATE' | 'EXCUSED';
 };
 
+type AttendanceScope = {
+  mode: 'CLASS' | 'SUBJECT';
+  schoolId: string;
+  schoolName: string;
+  institutionType: string;
+  isTertiary: boolean;
+  classId: string;
+  className: string;
+  levelCode: string | null;
+  departmentName: string;
+  subjectId: string | null;
+  displayCode: string;
+  displayName: string;
+  defaultThreshold: number;
+  isFormTeacher: boolean;
+  canEdit: boolean;
+};
+
 /**
  * Day 13: Smart Digital Attendance & Configurable Exam Eligibility Service
- * - Configurable exam eligibility percentage per course/subject (default 75%)
+ * - Configurable exam eligibility percentage per course/subject or class (default 75%)
+ * - Class-level daily attendance for Non-Tertiary schools (Form Teacher edit, subject teachers read-only)
+ * - Subject/course-level attendance for Tertiary institutions
  * - 1-tap Teacher Roll Call logging (PRESENT / LATE / EXCUSED / ABSENT)
- * - 5-minute 4-digit Lecture PIN generator & Student check-in
- * - Automated Multi-Channel Low-Attendance Exam Eligibility Alerts
+ * - 5-minute 4-digit Lecture/Class PIN generator & Student check-in
  */
 @Injectable()
 export class AttendanceService {
@@ -27,10 +46,129 @@ export class AttendanceService {
     private readonly notificationsService: NotificationsService,
   ) {}
 
-  /**
-   * Verify subject exists and that a TEACHER user is assigned to it (or its class)
-   */
-  private async verifySubjectAccess(userId: string, subjectId: string) {
+  private async getTermLockContext(
+    userId: string | undefined,
+    schoolId: string,
+    opts?: { termId?: string; sessionDate?: Date | string; sessionId?: string },
+  ) {
+    let isAdmin = false;
+    if (userId) {
+      const [user, membership] = await Promise.all([
+        this.prisma.user.findUnique({
+          where: { id: userId },
+          select: { role: true, schoolId: true },
+        }),
+        this.prisma.membership.findFirst({
+          where: { userId, schoolId, status: 'ACTIVE' },
+          select: { role: true },
+        }),
+      ]);
+      if (user?.role === 'SUPER_ADMIN') {
+        isAdmin = true;
+      } else if (
+        user?.role === 'SCHOOL_ADMIN' &&
+        (!user.schoolId || user.schoolId === schoolId)
+      ) {
+        isAdmin = true;
+      } else if (
+        membership &&
+        (membership.role === 'SCHOOL_ADMIN' || membership.role === 'SUPER_ADMIN')
+      ) {
+        isAdmin = true;
+      }
+    }
+
+    let targetDate: Date | null = null;
+    if (opts?.sessionId) {
+      const existingSession = await this.prisma.attendanceSession.findUnique({
+        where: { id: opts.sessionId },
+        select: { sessionDate: true },
+      });
+      if (existingSession?.sessionDate) {
+        targetDate = new Date(existingSession.sessionDate);
+      }
+    } else if (opts?.sessionDate) {
+      const parsed =
+        opts.sessionDate instanceof Date
+          ? opts.sessionDate
+          : new Date(opts.sessionDate);
+      if (!Number.isNaN(parsed.getTime())) {
+        targetDate = parsed;
+      }
+    }
+
+    const sessions = await this.prisma.academicSession.findMany({
+      where: { schoolId },
+      include: { terms: { orderBy: { createdAt: 'asc' } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    const allTerms = sessions.flatMap((s) => s.terms);
+
+    let targetTerm = opts?.termId
+      ? allTerms.find((t) => t.id === opts.termId)
+      : undefined;
+
+    if (!targetTerm && targetDate) {
+      const ts = targetDate.getTime();
+      targetTerm = allTerms.find((t) => {
+        if (!t.startDate || !t.endDate) return false;
+        const start = new Date(t.startDate).setUTCHours(0, 0, 0, 0);
+        const end = new Date(t.endDate).setUTCHours(23, 59, 59, 999);
+        return ts >= start && ts <= end;
+      });
+    }
+
+    if (!targetTerm) {
+      targetTerm =
+        allTerms.find((t) => t.isCurrent) ||
+        sessions.find((s) => s.isCurrent)?.terms?.[0] ||
+        allTerms[0];
+    }
+
+    const isClosed = Boolean(targetTerm?.isClosed);
+    const isDisabled = Boolean(
+      targetTerm &&
+        !targetTerm.isEnabled &&
+        !targetTerm.isCurrent &&
+        !targetTerm.isClosed,
+    );
+    const isLockedForUser = !isAdmin && (isClosed || isDisabled);
+
+    const lockMessage = isClosed
+      ? `${targetTerm?.name || 'This academic term'} is officially closed. Taking or editing student attendance is locked for teachers — only the School Admin can modify closed-term records. E-Library, Note Generation, CBT Generation, and other non-record portals remain available.`
+      : isDisabled
+        ? `${targetTerm?.name || 'This academic term'} has not been enabled by the School Admin yet.`
+        : null;
+
+    return {
+      isAdmin,
+      targetTerm: targetTerm ?? null,
+      isClosed,
+      isDisabled,
+      isLockedForUser,
+      lockMessage,
+    };
+  }
+
+  private async assertAttendanceEditableForUser(
+    userId: string | undefined,
+    schoolId: string,
+    opts?: { termId?: string; sessionDate?: Date | string; sessionId?: string },
+  ) {
+    const ctx = await this.getTermLockContext(userId, schoolId, opts);
+    if (ctx.isLockedForUser) {
+      throw new ForbiddenException(
+        ctx.lockMessage ||
+          'This academic term is locked. Only the School Admin can modify student attendance.',
+      );
+    }
+    return ctx;
+  }
+
+  private async resolveSubjectScope(
+    userId: string,
+    subjectId: string,
+  ): Promise<AttendanceScope> {
     const subject = await this.prisma.schoolSubject.findUnique({
       where: { id: subjectId },
       include: {
@@ -70,6 +208,7 @@ export class AttendanceService {
       throw new NotFoundException('Course / Subject not found.');
     }
 
+    const isFormTeacher = subject.schoolClass.formTeacherId === userId;
     if (userId) {
       const user = await this.prisma.user.findUnique({
         where: { id: userId },
@@ -81,9 +220,22 @@ export class AttendanceService {
         const isAssignedProfile = subject.assignedTeachers.some(
           (t) => t.userId === userId,
         );
-        const isFormTeacher = subject.schoolClass.formTeacherId === userId;
+        const handlesClassAllSubjects =
+          await this.prisma.teacherProfile.findFirst({
+            where: {
+              userId,
+              handlesAllSubjects: true,
+              assignedClasses: { some: { id: subject.classId } },
+            },
+            select: { id: true },
+          });
 
-        if (!isDirectTeacher && !isAssignedProfile && !isFormTeacher) {
+        if (
+          !isDirectTeacher &&
+          !isAssignedProfile &&
+          !isFormTeacher &&
+          !handlesClassAllSubjects
+        ) {
           throw new ForbiddenException(
             'Access denied: You are not assigned to manage attendance for this course.',
           );
@@ -91,7 +243,129 @@ export class AttendanceService {
       }
     }
 
-    return subject;
+    const instType = subject.school?.institutionType || 'SECONDARY';
+    return {
+      mode: 'SUBJECT',
+      schoolId: subject.schoolId,
+      schoolName: subject.school?.name || 'School',
+      institutionType: instType,
+      isTertiary: this.isTertiaryInstitution(instType),
+      classId: subject.classId,
+      className: subject.schoolClass.name,
+      levelCode: subject.schoolClass.levelCode,
+      departmentName: subject.department?.name || 'General',
+      subjectId: subject.id,
+      displayCode: subject.courseCode,
+      displayName: subject.name,
+      defaultThreshold:
+        subject.minAttendancePercent ??
+        subject.school?.defaultMinAttendancePercent ??
+        75,
+      isFormTeacher,
+      canEdit: true,
+    };
+  }
+
+  private async resolveClassScope(
+    userId: string,
+    classId: string,
+    requireWrite = false,
+  ): Promise<AttendanceScope> {
+    const schoolClass = await this.prisma.schoolClass.findUnique({
+      where: { id: classId },
+      include: {
+        school: {
+          select: {
+            id: true,
+            name: true,
+            institutionType: true,
+            defaultMinAttendancePercent: true,
+          },
+        },
+        department: {
+          select: { id: true, name: true, code: true },
+        },
+        teacherProfiles: {
+          select: { id: true, userId: true },
+        },
+        subjects: {
+          select: {
+            id: true,
+            teacherId: true,
+            assignedTeachers: { select: { userId: true } },
+          },
+        },
+      },
+    });
+
+    if (!schoolClass) {
+      throw new NotFoundException('Class / Arm not found.');
+    }
+
+    const instType = schoolClass.school?.institutionType || 'SECONDARY';
+    const isTertiary = this.isTertiaryInstitution(instType);
+    const isFormTeacher = schoolClass.formTeacherId === userId;
+    let canEdit = true;
+
+    if (userId) {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, role: true, schoolId: true },
+      });
+
+      if (user?.role === 'SCHOOL_ADMIN' || user?.role === 'SUPER_ADMIN') {
+        canEdit = true;
+      } else if (user?.role === 'TEACHER') {
+        const isAssignedClassTeacher = schoolClass.teacherProfiles.some(
+          (t) => t.userId === userId,
+        );
+        const teachesSubjectInClass = schoolClass.subjects.some(
+          (sub) =>
+            sub.teacherId === userId ||
+            sub.assignedTeachers.some((t) => t.userId === userId),
+        );
+
+        if (!isFormTeacher && !isAssignedClassTeacher && !teachesSubjectInClass) {
+          throw new ForbiddenException(
+            'Access denied: You are not assigned to this class or any of its subjects.',
+          );
+        }
+
+        canEdit = isTertiary ? true : isFormTeacher;
+        if (requireWrite && !canEdit) {
+          throw new ForbiddenException(
+            'Read-only access: Only the assigned Form Teacher for this class (or a School Admin) can mark or edit daily class attendance.',
+          );
+        }
+      }
+    }
+
+    return {
+      mode: 'CLASS',
+      schoolId: schoolClass.schoolId,
+      schoolName: schoolClass.school?.name || 'School',
+      institutionType: instType,
+      isTertiary,
+      classId: schoolClass.id,
+      className: schoolClass.name,
+      levelCode: schoolClass.levelCode,
+      departmentName: schoolClass.department?.name || 'General',
+      subjectId: null,
+      displayCode: schoolClass.name,
+      displayName: `${schoolClass.name} Daily Register`,
+      defaultThreshold:
+        schoolClass.minAttendancePercent ??
+        schoolClass.school?.defaultMinAttendancePercent ??
+        75,
+      isFormTeacher,
+      canEdit,
+    };
+  }
+
+  private buildSessionScopeWhere(scope: AttendanceScope) {
+    return scope.mode === 'CLASS'
+      ? { classId: scope.classId, subjectId: null }
+      : { subjectId: scope.subjectId! };
   }
 
   /**
@@ -247,10 +521,6 @@ export class AttendanceService {
     });
   }
 
-  /**
-   * 1. GET /attendance/subjects/:subjectId/summary
-   * Full attendance analytics, active PIN state, session history, weekday register state, and per-student eligibility
-   */
   async getSubjectAttendanceSummary(
     subjectId: string,
     overrideThreshold?: number,
@@ -258,27 +528,58 @@ export class AttendanceService {
     targetDate?: string,
     termId?: string,
   ) {
-    const subject = await this.verifySubjectAccess(userId || '', subjectId);
+    const scope = await this.resolveSubjectScope(userId || '', subjectId);
+    return this.getAttendanceSummaryForScope(
+      scope,
+      overrideThreshold,
+      targetDate,
+      termId,
+      userId,
+    );
+  }
+
+  async getClassAttendanceSummary(
+    classId: string,
+    overrideThreshold?: number,
+    userId?: string,
+    targetDate?: string,
+    termId?: string,
+  ) {
+    const scope = await this.resolveClassScope(userId || '', classId, false);
+    return this.getAttendanceSummaryForScope(
+      scope,
+      overrideThreshold,
+      targetDate,
+      termId,
+      userId,
+    );
+  }
+
+  private async getAttendanceSummaryForScope(
+    scope: AttendanceScope,
+    overrideThreshold?: number,
+    targetDate?: string,
+    termId?: string,
+    userId?: string,
+  ) {
     const dayRange = this.parseDayRange(targetDate);
 
     const configuredThresholdPercentage =
       overrideThreshold !== undefined && !Number.isNaN(overrideThreshold)
         ? Math.min(100, Math.max(10, Number(overrideThreshold)))
-        : (subject.minAttendancePercent ??
-          subject.school?.defaultMinAttendancePercent ??
-          75);
+        : scope.defaultThreshold;
 
     const [allSessions, students, sessionsMeta] = await Promise.all([
       this.prisma.attendanceSession.findMany({
-        where: { subjectId: subject.id },
+        where: this.buildSessionScopeWhere(scope),
         include: {
           records: true,
         },
         orderBy: { sessionDate: 'desc' },
       }),
-      this.getEnrolledStudentsForClass(subject.schoolId, subject.classId),
+      this.getEnrolledStudentsForClass(scope.schoolId, scope.classId),
       this.prisma.academicSession.findMany({
-        where: { schoolId: subject.schoolId },
+        where: { schoolId: scope.schoolId },
         include: { terms: { orderBy: { createdAt: 'asc' } } },
         orderBy: { createdAt: 'desc' },
       }),
@@ -291,10 +592,20 @@ export class AttendanceService {
         shortName: t.name,
         sessionName: s.name,
         isCurrent: t.isCurrent,
+        isEnabled: t.isEnabled,
+        isClosed: t.isClosed,
         startDate: t.startDate?.toISOString() ?? null,
         endDate: t.endDate?.toISOString() ?? null,
       })),
     );
+
+    const termLock = await this.getTermLockContext(userId, scope.schoolId, {
+      termId,
+      sessionDate: targetDate || dayRange.isoDate,
+    });
+    const effectiveCanEdit = termLock.isAdmin
+      ? scope.canEdit
+      : scope.canEdit && !termLock.isLockedForUser;
 
     const selectedTerm = termId ? terms.find((t) => t.id === termId) : undefined;
     const sessions =
@@ -311,7 +622,6 @@ export class AttendanceService {
     const totalSessions = sessions.length;
     const now = new Date();
 
-    // Find active PIN session if any
     const activePinRaw = allSessions.find(
       (s) => s.pinCode && s.pinExpiresAt && new Date(s.pinExpiresAt) > now,
     );
@@ -335,14 +645,12 @@ export class AttendanceService {
         }
       : null;
 
-    // Session matching the requested calendar day (Mon-Fri register / specific lecture day)
     const selectedDaySession =
       allSessions.find((s) => {
         const dt = new Date(s.sessionDate);
         return dt >= dayRange.startOfDay && dt <= dayRange.endOfDay;
       }) || null;
 
-    // Build per-student attendance roster
     const roster = students.map((student) => {
       let presentCount = 0;
       let lateCount = 0;
@@ -438,19 +746,26 @@ export class AttendanceService {
     );
 
     return {
-      subjectId: subject.id,
+      mode: scope.mode,
+      isFormTeacher: scope.isFormTeacher,
+      canEdit: effectiveCanEdit,
+      isTermClosed: termLock.isClosed,
+      isTermDisabled: termLock.isDisabled,
+      termLockReason: termLock.isLockedForUser ? termLock.lockMessage : null,
+      classId: scope.classId,
+      subjectId: scope.subjectId,
       subject: {
-        id: subject.id,
-        name: subject.name,
-        courseCode: subject.courseCode,
-        creditUnits: subject.creditUnits,
-        classId: subject.classId,
-        className: subject.schoolClass.name,
-        levelCode: subject.schoolClass.levelCode,
-        departmentName: subject.department?.name || 'General',
+        id: scope.subjectId || scope.classId,
+        name: scope.displayName,
+        courseCode: scope.displayCode,
+        creditUnits: 0,
+        classId: scope.classId,
+        className: scope.className,
+        levelCode: scope.levelCode,
+        departmentName: scope.departmentName,
         minAttendancePercent: configuredThresholdPercentage,
-        institutionType: subject.school?.institutionType || 'SECONDARY',
-        isTertiary: this.isTertiaryInstitution(subject.school?.institutionType),
+        institutionType: scope.institutionType,
+        isTertiary: scope.isTertiary,
       },
       configuredThresholdPercentage,
       selectedDate: dayRange.isoDate,
@@ -473,8 +788,7 @@ export class AttendanceService {
   }
 
   /**
-   * 2. PATCH /attendance/subjects/:subjectId/threshold
-   * Update minimum required attendance percentage for exam eligibility
+   * 2. PATCH /attendance/subjects/:subjectId/threshold & /attendance/classes/:classId/threshold
    */
   async updateSubjectThreshold(
     userId: string,
@@ -488,7 +802,8 @@ export class AttendanceService {
       );
     }
 
-    await this.verifySubjectAccess(userId, subjectId);
+    const scope = await this.resolveSubjectScope(userId, subjectId);
+    await this.assertAttendanceEditableForUser(userId, scope.schoolId);
 
     const updated = await this.prisma.schoolSubject.update({
       where: { id: subjectId },
@@ -504,23 +819,59 @@ export class AttendanceService {
     };
   }
 
+  async updateClassThreshold(
+    userId: string,
+    classId: string,
+    minAttendancePercent: number,
+  ) {
+    const parsed = Number(minAttendancePercent);
+    if (Number.isNaN(parsed) || parsed < 10 || parsed > 100) {
+      throw new BadRequestException(
+        'Minimum attendance benchmark must be between 10% and 100%.',
+      );
+    }
+
+    const scope = await this.resolveClassScope(userId, classId, true);
+    await this.assertAttendanceEditableForUser(userId, scope.schoolId);
+
+    const updated = await this.prisma.schoolClass.update({
+      where: { id: classId },
+      data: { minAttendancePercent: parsed },
+    });
+
+    return {
+      classId: updated.id,
+      name: updated.name,
+      minAttendancePercent: updated.minAttendancePercent,
+      message: `Attendance cutoff for ${updated.name} updated to ${updated.minAttendancePercent}%.`,
+    };
+  }
+
   /**
    * 3. POST /attendance/sessions/pin
-   * Generate a 5-minute 4-digit Lecture PIN for classroom student check-in
+   * Generate a 5-minute 4-digit Lecture / Class PIN for student check-in
    */
   async generateLecturePin(
     userId: string,
     payload: {
-      subjectId: string;
+      subjectId?: string;
+      classId?: string;
       durationMinutes?: number;
       sessionId?: string;
     },
   ) {
-    if (!payload.subjectId) {
-      throw new BadRequestException('subjectId is required.');
+    if (!payload.subjectId && !payload.classId) {
+      throw new BadRequestException('Either subjectId or classId is required.');
     }
 
-    const subject = await this.verifySubjectAccess(userId, payload.subjectId);
+    const scope = payload.classId && !payload.subjectId
+      ? await this.resolveClassScope(userId, payload.classId, true)
+      : await this.resolveSubjectScope(userId, payload.subjectId!);
+    await this.assertAttendanceEditableForUser(userId, scope.schoolId, {
+      sessionId: payload.sessionId,
+      sessionDate: new Date(),
+    });
+
     const durationMinutes = Math.min(
       30,
       Math.max(1, Number(payload.durationMinutes || 5)),
@@ -529,12 +880,11 @@ export class AttendanceService {
     const now = new Date();
     const pinExpiresAt = new Date(now.getTime() + durationMinutes * 60 * 1000);
 
-    // Generate unique 4-digit PIN (1000 - 9999)
     let pinCode = String(Math.floor(1000 + Math.random() * 9000));
     for (let attempt = 0; attempt < 5; attempt++) {
       const collision = await this.prisma.attendanceSession.findFirst({
         where: {
-          schoolId: subject.schoolId,
+          schoolId: scope.schoolId,
           pinCode,
           pinExpiresAt: { gt: now },
         },
@@ -543,7 +893,6 @@ export class AttendanceService {
       pinCode = String(Math.floor(1000 + Math.random() * 9000));
     }
 
-    // Reuse today's session if created within last 3 hours or if sessionId is specified
     const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000);
     let session = payload.sessionId
       ? await this.prisma.attendanceSession.findUnique({
@@ -551,7 +900,7 @@ export class AttendanceService {
         })
       : await this.prisma.attendanceSession.findFirst({
           where: {
-            subjectId: subject.id,
+            ...this.buildSessionScopeWhere(scope),
             sessionDate: { gte: threeHoursAgo },
           },
           orderBy: { sessionDate: 'desc' },
@@ -568,9 +917,9 @@ export class AttendanceService {
     } else {
       session = await this.prisma.attendanceSession.create({
         data: {
-          schoolId: subject.schoolId,
-          classId: subject.classId,
-          subjectId: subject.id,
+          schoolId: scope.schoolId,
+          classId: scope.classId,
+          subjectId: scope.subjectId,
           teacherId: userId,
           sessionDate: now,
           pinCode,
@@ -579,26 +928,29 @@ export class AttendanceService {
       });
     }
 
-    // Notify enrolled students in the class cohort
     const enrolledStudents = await this.getEnrolledStudentsForClass(
-      subject.schoolId,
-      subject.classId,
+      scope.schoolId,
+      scope.classId,
     );
 
     void Promise.all(
       enrolledStudents.map((st) =>
         this.notificationsService.dispatchNotification({
           userId: st.studentId,
-          schoolId: subject.schoolId,
-          title: `📍 Lecture Check-In Open: ${subject.courseCode}`,
-          body: `Enter 4-digit PIN ${pinCode} within ${durationMinutes} minutes to mark your attendance for ${subject.name}.`,
+          schoolId: scope.schoolId,
+          title:
+            scope.mode === 'CLASS'
+              ? `📍 Daily Roll Call Check-In: ${scope.className}`
+              : `📍 Lecture Check-In Open: ${scope.displayCode}`,
+          body: `Enter 4-digit PIN ${pinCode} within ${durationMinutes} minutes to mark your attendance for ${scope.displayName}.`,
           category: 'SCHOOL',
           deepLink: '/attendance',
           dataJson: {
             type: 'LECTURE_PIN_OPEN',
             sessionId: session.id,
-            subjectId: subject.id,
-            courseCode: subject.courseCode,
+            classId: scope.classId,
+            subjectId: scope.subjectId,
+            courseCode: scope.displayCode,
           },
           channels: { inApp: true, push: true, email: false },
         }),
@@ -607,10 +959,11 @@ export class AttendanceService {
 
     return {
       sessionId: session.id,
-      subjectId: subject.id,
-      courseCode: subject.courseCode,
-      subjectName: subject.name,
-      className: subject.schoolClass.name,
+      classId: scope.classId,
+      subjectId: scope.subjectId,
+      courseCode: scope.displayCode,
+      subjectName: scope.displayName,
+      className: scope.className,
       pinCode,
       pinExpiresAt: pinExpiresAt.toISOString(),
       durationMinutes,
@@ -620,20 +973,21 @@ export class AttendanceService {
 
   /**
    * 4. POST /attendance/sessions/roll-call
-   * Teacher 1-tap bulk roll-call logging for an AttendanceSession
+   * Teacher 1-tap bulk roll-call logging for an AttendanceSession (subject or class)
    */
   async recordRollCall(
     userId: string,
     payload: {
-      subjectId: string;
+      subjectId?: string;
+      classId?: string;
       sessionId?: string;
       sessionDate?: string;
       startNewSession?: boolean;
       records: RollCallEntryInput[];
     },
   ) {
-    if (!payload.subjectId) {
-      throw new BadRequestException('subjectId is required.');
+    if (!payload.subjectId && !payload.classId) {
+      throw new BadRequestException('Either subjectId or classId is required.');
     }
     if (!Array.isArray(payload.records) || payload.records.length === 0) {
       throw new BadRequestException(
@@ -641,10 +995,18 @@ export class AttendanceService {
       );
     }
 
-    const subject = await this.verifySubjectAccess(userId, payload.subjectId);
+    const scope = payload.classId && !payload.subjectId
+      ? await this.resolveClassScope(userId, payload.classId, true)
+      : await this.resolveSubjectScope(userId, payload.subjectId!);
+
     const now = new Date();
     const dayRange = this.parseDayRange(payload.sessionDate);
     const isToday = dayRange.isoDate === this.toLocalDateStr(now);
+
+    await this.assertAttendanceEditableForUser(userId, scope.schoolId, {
+      sessionId: payload.sessionId,
+      sessionDate: payload.sessionDate || dayRange.isoDate,
+    });
 
     let session = null;
     if (payload.sessionId) {
@@ -654,7 +1016,7 @@ export class AttendanceService {
     } else if (!payload.startNewSession) {
       session = await this.prisma.attendanceSession.findFirst({
         where: {
-          subjectId: subject.id,
+          ...this.buildSessionScopeWhere(scope),
           sessionDate: {
             gte: dayRange.startOfDay,
             lte: dayRange.endOfDay,
@@ -667,9 +1029,9 @@ export class AttendanceService {
     if (!session) {
       session = await this.prisma.attendanceSession.create({
         data: {
-          schoolId: subject.schoolId,
-          classId: subject.classId,
-          subjectId: subject.id,
+          schoolId: scope.schoolId,
+          classId: scope.classId,
+          subjectId: scope.subjectId,
           teacherId: userId,
           sessionDate: isToday ? now : dayRange.noonOfDay,
         },
@@ -707,14 +1069,12 @@ export class AttendanceService {
       }),
     );
 
-    const updatedSummary = await this.getSubjectAttendanceSummary(
-      subject.id,
+    const updatedSummary = await this.getAttendanceSummaryForScope(
+      scope,
       undefined,
-      userId,
       dayRange.isoDate,
     );
 
-    // Send low-attendance warning if totalSessions >= 2 and student was marked ABSENT and is below threshold
     if (updatedSummary.totalSessions >= 2) {
       const absentStudentIds = new Set(
         payload.records
@@ -730,13 +1090,13 @@ export class AttendanceService {
         newlyAtRisk.map((st) =>
           this.notificationsService.dispatchNotification({
             userId: st.studentId,
-            schoolId: subject.schoolId,
-            title: `⚠️ Exam Eligibility Warning: ${subject.courseCode}`,
-            body: `Your attendance in ${subject.name} is ${st.attendancePercent}% (${st.attendedCount}/${st.totalSessions} classes), below the ${updatedSummary.configuredThresholdPercentage}% exam requirement.`,
+            schoolId: scope.schoolId,
+            title: `⚠️ Attendance Alert: ${scope.displayCode}`,
+            body: `Your attendance in ${scope.displayName} is ${st.attendancePercent}% (${st.attendedCount}/${st.totalSessions} days), below the ${updatedSummary.configuredThresholdPercentage}% requirement.`,
             category: 'SCHOOL',
             deepLink: '/attendance',
             channels: { inApp: true, push: true, email: true },
-            emailSubject: `⚠️ Exam Eligibility Alert: ${subject.courseCode} (${subject.name})`,
+            emailSubject: `⚠️ Attendance Alert: ${scope.displayName}`,
           }),
         ),
       );
@@ -821,16 +1181,27 @@ export class AttendanceService {
     }
 
     if (effectiveClassId && session.classId !== effectiveClassId) {
+      const targetCode = session.subject?.courseCode || session.schoolClass.name;
       throw new ForbiddenException(
-        `This Lecture PIN belongs to ${session.schoolClass.name} (${session.subject.courseCode}), which is outside your enrolled class cohort.`,
+        `This Check-In PIN belongs to ${session.schoolClass.name} (${targetCode}), which is outside your enrolled class cohort.`,
       );
     }
 
     const now = new Date();
     if (!session.pinExpiresAt || new Date(session.pinExpiresAt) < now) {
       throw new BadRequestException(
-        'This Lecture PIN has expired. Please ask your lecturer to regenerate the PIN or mark you via roll call.',
+        'This Check-In PIN has expired. Please ask your teacher/lecturer to regenerate the PIN or mark you via roll call.',
       );
+    }
+
+    if (
+      effectiveSchoolId &&
+      session.sessionDate
+    ) {
+      await this.assertAttendanceEditableForUser(studentId, effectiveSchoolId, {
+        sessionId: session.id,
+        sessionDate: session.sessionDate,
+      });
     }
 
     const record = await this.prisma.attendanceRecord.upsert({
@@ -852,9 +1223,12 @@ export class AttendanceService {
       },
     });
 
-    // Calculate student's updated attendance in this subject
+    const scopeWhere = session.subjectId
+      ? { subjectId: session.subjectId }
+      : { classId: session.classId, subjectId: null };
+
     const allSessions = await this.prisma.attendanceSession.findMany({
-      where: { subjectId: session.subjectId },
+      where: scopeWhere,
       include: {
         records: {
           where: { studentId },
@@ -874,12 +1248,15 @@ export class AttendanceService {
 
     const attendancePercent =
       totalSessions > 0 ? Math.round((attendedCount / totalSessions) * 100) : 100;
-    const minAttendancePercent = session.subject.minAttendancePercent ?? 75;
+    const minAttendancePercent = session.subject?.minAttendancePercent ?? 75;
     const examEligible = attendancePercent >= minAttendancePercent;
+    const displayCode = session.subject?.courseCode || session.schoolClass.name;
+    const displayName =
+      session.subject?.name || `${session.schoolClass.name} Daily Register`;
 
     return {
       checkedIn: true,
-      message: `Checked in to ${session.subject.courseCode} (${session.subject.name})!`,
+      message: `Checked in to ${displayCode} (${displayName})!`,
       record: {
         id: record.id,
         sessionId: session.id,
@@ -887,9 +1264,9 @@ export class AttendanceService {
         checkedInAt: record.checkedInAt.toISOString(),
       },
       subject: {
-        id: session.subject.id,
-        courseCode: session.subject.courseCode,
-        name: session.subject.name,
+        id: session.subject?.id || session.classId,
+        courseCode: displayCode,
+        name: displayName,
         attendedCount,
         totalSessions,
         attendancePercent,
@@ -921,6 +1298,7 @@ export class AttendanceService {
               id: true,
               name: true,
               levelCode: true,
+              minAttendancePercent: true,
             },
           },
         },
@@ -941,6 +1319,7 @@ export class AttendanceService {
               id: true,
               name: true,
               levelCode: true,
+              minAttendancePercent: true,
             },
           },
         },
@@ -954,35 +1333,24 @@ export class AttendanceService {
       return {
         enrolledInSchool: false,
         schoolName: null,
+        institutionType: null,
+        isTertiary: true,
+        attendanceMode: 'SUBJECT' as const,
         className: null,
+        levelCode: null,
         overallAttendancePercent: 100,
         overallExamEligible: true,
         eligibleCoursesCount: 0,
         totalCoursesCount: 0,
+        classAttendance: null,
         activePinSessions: [],
         subjects: [],
+        dailyLogs: [],
         recentRecords: [],
       };
     }
 
-    const subjects = await this.prisma.schoolSubject.findMany({
-      where: {
-        schoolId: school.id,
-        classId: schoolClass.id,
-      },
-      include: {
-        attendanceSessions: {
-          include: {
-            records: {
-              where: { studentId },
-            },
-          },
-          orderBy: { sessionDate: 'desc' },
-        },
-      },
-      orderBy: { courseCode: 'asc' },
-    });
-
+    const isTertiary = this.isTertiaryInstitution(school.institutionType);
     const now = new Date();
     const activePinSessions: Array<{
       sessionId: string;
@@ -993,58 +1361,115 @@ export class AttendanceService {
       remainingSeconds: number;
       alreadyCheckedIn: boolean;
     }> = [];
+    const dailyLogs: Array<{
+      sessionId: string;
+      dateStr: string;
+      sessionDate: string;
+      weekday: string;
+      courseCode: string;
+      scopeLabel: string;
+      status: 'PRESENT' | 'LATE' | 'EXCUSED' | 'ABSENT';
+      checkedInAt: string | null;
+    }> = [];
 
-    const subjectBreakdowns = subjects.map((subj) => {
-      const totalSessions = subj.attendanceSessions.length;
+    let subjectBreakdowns: Array<{
+      subjectId: string;
+      name: string;
+      courseCode: string;
+      creditUnits: number | null;
+      minAttendancePercent: number;
+      totalSessions: number;
+      presentCount: number;
+      lateCount: number;
+      excusedCount: number;
+      absentCount: number;
+      attendedCount: number;
+      attendancePercent: number;
+      examEligible: boolean;
+      sessionsNeededForEligibility: number;
+    }> = [];
+
+    let overallAttendancePercent = 100;
+    let overallExamEligible = true;
+    let eligibleCoursesCount = 0;
+    let classAttendance: {
+      classId: string;
+      className: string;
+      minAttendancePercent: number;
+      totalSessions: number;
+      presentCount: number;
+      lateCount: number;
+      excusedCount: number;
+      absentCount: number;
+      attendedCount: number;
+      attendancePercent: number;
+      examEligible: boolean;
+      sessionsNeededForEligibility: number;
+    } | null = null;
+
+    if (!isTertiary) {
+      // Non-tertiary schools (Primary / Secondary / K-12): attendance is taken by Class Form Register
+      const classSessions = await this.prisma.attendanceSession.findMany({
+        where: {
+          schoolId: school.id,
+          classId: schoolClass.id,
+          subjectId: null,
+        },
+        include: {
+          records: {
+            where: { studentId },
+          },
+        },
+        orderBy: { sessionDate: 'desc' },
+      });
+
+      const totalSessions = classSessions.length;
       let presentCount = 0;
       let lateCount = 0;
       let excusedCount = 0;
       let absentCount = 0;
 
-      for (const session of subj.attendanceSessions) {
+      for (const session of classSessions) {
         const myRecord = session.records[0];
+        const status: 'PRESENT' | 'LATE' | 'EXCUSED' | 'ABSENT' =
+          myRecord?.status === 'PRESENT'
+            ? 'PRESENT'
+            : myRecord?.status === 'LATE'
+            ? 'LATE'
+            : myRecord?.status === 'EXCUSED'
+            ? 'EXCUSED'
+            : 'ABSENT';
 
-        if (
-          session.pinCode &&
-          session.pinExpiresAt &&
-          new Date(session.pinExpiresAt) > now
-        ) {
-          activePinSessions.push({
-            sessionId: session.id,
-            subjectId: subj.id,
-            courseCode: subj.courseCode,
-            subjectName: subj.name,
-            pinExpiresAt: session.pinExpiresAt.toISOString(),
-            remainingSeconds: Math.max(
-              0,
-              Math.floor(
-                (new Date(session.pinExpiresAt).getTime() - now.getTime()) /
-                  1000,
-              ),
-            ),
-            alreadyCheckedIn: Boolean(
-              myRecord &&
-                (myRecord.status === 'PRESENT' || myRecord.status === 'LATE'),
-            ),
-          });
-        }
-
-        if (!myRecord) {
-          absentCount += 1;
-        } else if (myRecord.status === 'PRESENT') {
+        if (status === 'PRESENT') {
           presentCount += 1;
-        } else if (myRecord.status === 'LATE') {
+        } else if (status === 'LATE') {
           lateCount += 1;
-        } else if (myRecord.status === 'EXCUSED') {
+        } else if (status === 'EXCUSED') {
           excusedCount += 1;
         } else {
           absentCount += 1;
         }
+
+        const dateObj = new Date(session.sessionDate);
+        dailyLogs.push({
+          sessionId: session.id,
+          dateStr: this.toLocalDateStr(dateObj),
+          sessionDate: dateObj.toISOString(),
+          weekday: dateObj.toLocaleDateString('en-US', { weekday: 'short' }),
+          courseCode: schoolClass.levelCode || schoolClass.name,
+          scopeLabel: `${schoolClass.name} Daily Register`,
+          status,
+          checkedInAt: myRecord?.checkedInAt
+            ? myRecord.checkedInAt.toISOString()
+            : null,
+        });
       }
 
       const attendedCount = presentCount + lateCount + excusedCount;
       const minAttendancePercent =
-        subj.minAttendancePercent ?? school.defaultMinAttendancePercent ?? 75;
+        schoolClass.minAttendancePercent ??
+        school.defaultMinAttendancePercent ??
+        75;
       const attendancePercent =
         totalSessions > 0
           ? Math.round((attendedCount / totalSessions) * 100)
@@ -1052,7 +1477,6 @@ export class AttendanceService {
       const examEligible =
         totalSessions === 0 ? true : attendancePercent >= minAttendancePercent;
 
-      // Compute how many consecutive future classes are needed to reach threshold if currently below
       let sessionsNeededForEligibility = 0;
       if (!examEligible && minAttendancePercent < 100) {
         const targetRatio = minAttendancePercent / 100;
@@ -1062,11 +1486,9 @@ export class AttendanceService {
         sessionsNeededForEligibility = Math.max(1, needed);
       }
 
-      return {
-        subjectId: subj.id,
-        name: subj.name,
-        courseCode: subj.courseCode,
-        creditUnits: subj.creditUnits,
+      classAttendance = {
+        classId: schoolClass.id,
+        className: schoolClass.name,
         minAttendancePercent,
         totalSessions,
         presentCount,
@@ -1078,29 +1500,188 @@ export class AttendanceService {
         examEligible,
         sessionsNeededForEligibility,
       };
-    });
 
-    const coursesWithSessions = subjectBreakdowns.filter(
-      (s) => s.totalSessions > 0,
-    );
-    const overallAttendancePercent =
-      coursesWithSessions.length > 0
-        ? Math.round(
-            coursesWithSessions.reduce(
-              (acc, s) => acc + s.attendancePercent,
-              0,
-            ) / coursesWithSessions.length,
-          )
-        : 100;
+      subjectBreakdowns = [
+        {
+          subjectId: schoolClass.id,
+          name: `${schoolClass.name} Daily Class Attendance`,
+          courseCode: schoolClass.levelCode || schoolClass.name,
+          creditUnits: 0,
+          minAttendancePercent,
+          totalSessions,
+          presentCount,
+          lateCount,
+          excusedCount,
+          absentCount,
+          attendedCount,
+          attendancePercent,
+          examEligible,
+          sessionsNeededForEligibility,
+        },
+      ];
 
-    const eligibleCoursesCount = subjectBreakdowns.filter(
-      (s) => s.examEligible,
-    ).length;
-    const overallExamEligible =
-      eligibleCoursesCount === subjectBreakdowns.length;
+      overallAttendancePercent = attendancePercent;
+      overallExamEligible = examEligible;
+      eligibleCoursesCount = examEligible ? 1 : 0;
+    } else {
+      const subjects = await this.prisma.schoolSubject.findMany({
+        where: {
+          schoolId: school.id,
+          classId: schoolClass.id,
+        },
+        include: {
+          attendanceSessions: {
+            include: {
+              records: {
+                where: { studentId },
+              },
+            },
+            orderBy: { sessionDate: 'desc' },
+          },
+        },
+        orderBy: { courseCode: 'asc' },
+      });
+
+      subjectBreakdowns = subjects.map((subj) => {
+        const totalSessions = subj.attendanceSessions.length;
+        let presentCount = 0;
+        let lateCount = 0;
+        let excusedCount = 0;
+        let absentCount = 0;
+
+        for (const session of subj.attendanceSessions) {
+          const myRecord = session.records[0];
+
+          if (
+            session.pinCode &&
+            session.pinExpiresAt &&
+            new Date(session.pinExpiresAt) > now
+          ) {
+            activePinSessions.push({
+              sessionId: session.id,
+              subjectId: subj.id,
+              courseCode: subj.courseCode,
+              subjectName: subj.name,
+              pinExpiresAt: session.pinExpiresAt.toISOString(),
+              remainingSeconds: Math.max(
+                0,
+                Math.floor(
+                  (new Date(session.pinExpiresAt).getTime() - now.getTime()) /
+                    1000,
+                ),
+              ),
+              alreadyCheckedIn: Boolean(
+                myRecord &&
+                  (myRecord.status === 'PRESENT' || myRecord.status === 'LATE'),
+              ),
+            });
+          }
+
+          const resolvedStatus: 'PRESENT' | 'LATE' | 'EXCUSED' | 'ABSENT' =
+            myRecord?.status === 'PRESENT'
+              ? 'PRESENT'
+              : myRecord?.status === 'LATE'
+              ? 'LATE'
+              : myRecord?.status === 'EXCUSED'
+              ? 'EXCUSED'
+              : 'ABSENT';
+
+          if (resolvedStatus === 'PRESENT') {
+            presentCount += 1;
+          } else if (resolvedStatus === 'LATE') {
+            lateCount += 1;
+          } else if (resolvedStatus === 'EXCUSED') {
+            excusedCount += 1;
+          } else {
+            absentCount += 1;
+          }
+
+          const dateObj = new Date(session.sessionDate);
+          dailyLogs.push({
+            sessionId: session.id,
+            dateStr: this.toLocalDateStr(dateObj),
+            sessionDate: dateObj.toISOString(),
+            weekday: dateObj.toLocaleDateString('en-US', { weekday: 'short' }),
+            courseCode: subj.courseCode,
+            scopeLabel: `${subj.courseCode} — ${subj.name}`,
+            status: resolvedStatus,
+            checkedInAt: myRecord?.checkedInAt
+              ? myRecord.checkedInAt.toISOString()
+              : null,
+          });
+        }
+
+        const attendedCount = presentCount + lateCount + excusedCount;
+        const minAttendancePercent =
+          subj.minAttendancePercent ?? school.defaultMinAttendancePercent ?? 75;
+        const attendancePercent =
+          totalSessions > 0
+            ? Math.round((attendedCount / totalSessions) * 100)
+            : 100;
+        const examEligible =
+          totalSessions === 0
+            ? true
+            : attendancePercent >= minAttendancePercent;
+
+        let sessionsNeededForEligibility = 0;
+        if (!examEligible && minAttendancePercent < 100) {
+          const targetRatio = minAttendancePercent / 100;
+          const needed = Math.ceil(
+            (targetRatio * totalSessions - attendedCount) / (1 - targetRatio),
+          );
+          sessionsNeededForEligibility = Math.max(1, needed);
+        }
+
+        return {
+          subjectId: subj.id,
+          name: subj.name,
+          courseCode: subj.courseCode,
+          creditUnits: subj.creditUnits,
+          minAttendancePercent,
+          totalSessions,
+          presentCount,
+          lateCount,
+          excusedCount,
+          absentCount,
+          attendedCount,
+          attendancePercent,
+          examEligible,
+          sessionsNeededForEligibility,
+        };
+      });
+
+      const coursesWithSessions = subjectBreakdowns.filter(
+        (s) => s.totalSessions > 0,
+      );
+      overallAttendancePercent =
+        coursesWithSessions.length > 0
+          ? Math.round(
+              coursesWithSessions.reduce(
+                (acc, s) => acc + s.attendancePercent,
+                0,
+              ) / coursesWithSessions.length,
+            )
+          : 100;
+
+      eligibleCoursesCount = subjectBreakdowns.filter(
+        (s) => s.examEligible,
+      ).length;
+      overallExamEligible =
+        eligibleCoursesCount === subjectBreakdowns.length;
+    }
 
     const recentRecordsRaw = await this.prisma.attendanceRecord.findMany({
-      where: { studentId },
+      where: {
+        studentId,
+        ...(!isTertiary
+          ? {
+              session: {
+                schoolId: school.id,
+                subjectId: null,
+              },
+            }
+          : {}),
+      },
       include: {
         session: {
           include: {
@@ -1111,60 +1692,142 @@ export class AttendanceService {
                 courseCode: true,
               },
             },
+            schoolClass: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
           },
         },
       },
-      orderBy: { checkedInAt: 'desc' },
-      take: 15,
+      orderBy: [{ session: { sessionDate: 'desc' } }, { checkedInAt: 'desc' }],
+      take: isTertiary ? 30 : 60,
     });
 
-    const recentRecords = recentRecordsRaw.map((r) => ({
-      id: r.id,
-      sessionId: r.sessionId,
-      status: r.status,
-      checkedInAt: r.checkedInAt.toISOString(),
-      sessionDate: r.session.sessionDate.toISOString(),
-      subjectId: r.session.subject.id,
-      courseCode: r.session.subject.courseCode,
-      subjectName: r.session.subject.name,
-    }));
+    const activeClassPins = await this.prisma.attendanceSession.findMany({
+      where: {
+        schoolId: school.id,
+        classId: schoolClass.id,
+        subjectId: null,
+        pinCode: { not: null },
+        pinExpiresAt: { gt: now },
+      },
+      include: { records: { where: { studentId } } },
+    });
+
+    for (const clsSess of activeClassPins) {
+      const myRecord = clsSess.records[0];
+      activePinSessions.push({
+        sessionId: clsSess.id,
+        subjectId: schoolClass.id,
+        courseCode: schoolClass.name,
+        subjectName: `${schoolClass.name} Daily Register`,
+        pinExpiresAt: clsSess.pinExpiresAt!.toISOString(),
+        remainingSeconds: Math.max(
+          0,
+          Math.floor(
+            (new Date(clsSess.pinExpiresAt!).getTime() - now.getTime()) / 1000,
+          ),
+        ),
+        alreadyCheckedIn: Boolean(
+          myRecord &&
+            (myRecord.status === 'PRESENT' || myRecord.status === 'LATE'),
+        ),
+      });
+    }
+
+    const recentRecords = recentRecordsRaw.map((r) => {
+      const classLabel = r.session.schoolClass?.name || schoolClass.name;
+      return {
+        id: r.id,
+        sessionId: r.sessionId,
+        status: r.status,
+        checkedInAt: r.checkedInAt.toISOString(),
+        sessionDate: r.session.sessionDate.toISOString(),
+        dateStr: this.toLocalDateStr(r.session.sessionDate),
+        weekday: r.session.sessionDate.toLocaleDateString('en-US', {
+          weekday: 'short',
+        }),
+        subjectId: isTertiary
+          ? r.session.subject?.id || r.session.classId
+          : r.session.classId,
+        courseCode: isTertiary
+          ? r.session.subject?.courseCode || classLabel || 'CLASS'
+          : classLabel || 'CLASS',
+        subjectName: isTertiary
+          ? r.session.subject?.name || `${classLabel} Daily Register`
+          : `${classLabel} Daily Attendance`,
+      };
+    });
+
+    dailyLogs.sort(
+      (a, b) =>
+        new Date(b.sessionDate).getTime() - new Date(a.sessionDate).getTime(),
+    );
 
     return {
       enrolledInSchool: true,
       schoolName: school.name,
       institutionType: school.institutionType,
+      isTertiary,
+      attendanceMode: isTertiary ? ('SUBJECT' as const) : ('CLASS' as const),
       className: schoolClass.name,
       levelCode: schoolClass.levelCode,
       overallAttendancePercent,
       overallExamEligible,
       eligibleCoursesCount,
       totalCoursesCount: subjectBreakdowns.length,
+      classAttendance,
       activePinSessions,
       subjects: subjectBreakdowns,
+      dailyLogs,
       recentRecords,
     };
   }
 
   /**
    * 6. GET /attendance/subjects/:subjectId/sessions/:sessionId/detail
-   * Full daily roll-call sheet + downloadable CSV for a single day/session
+   * &  GET /attendance/classes/:classId/sessions/:sessionId/detail
    */
   async getDailySessionDetail(
     userId: string,
     subjectId: string,
     sessionId: string,
   ) {
-    const subject = await this.verifySubjectAccess(userId, subjectId);
+    const scope = await this.resolveSubjectScope(userId, subjectId);
+    return this.getDailySessionDetailForScope(scope, sessionId);
+  }
+
+  async getClassDailySessionDetail(
+    userId: string,
+    classId: string,
+    sessionId: string,
+  ) {
+    const scope = await this.resolveClassScope(userId, classId, false);
+    return this.getDailySessionDetailForScope(scope, sessionId);
+  }
+
+  private async getDailySessionDetailForScope(
+    scope: AttendanceScope,
+    sessionId: string,
+  ) {
     const [session, students] = await Promise.all([
       this.prisma.attendanceSession.findUnique({
         where: { id: sessionId },
         include: { records: true },
       }),
-      this.getEnrolledStudentsForClass(subject.schoolId, subject.classId),
+      this.getEnrolledStudentsForClass(scope.schoolId, scope.classId),
     ]);
 
-    if (!session || session.subjectId !== subject.id) {
-      throw new NotFoundException('Attendance session not found for this course/subject.');
+    const matchesScope =
+      session &&
+      (scope.mode === 'CLASS'
+        ? session.classId === scope.classId && !session.subjectId
+        : session.subjectId === scope.subjectId);
+
+    if (!matchesScope || !session) {
+      throw new NotFoundException('Attendance session not found.');
     }
 
     const recordMap = new Map(session.records.map((r) => [r.studentId, r]));
@@ -1191,14 +1854,14 @@ export class AttendanceService {
     const displayDate = this.formatCsvDisplayDate(dateObj);
 
     const csvLines = [
-      'S/N,Student Name,ID No,Course,Class,Date,Status,Time / Mode',
+      'S/N,Student Name,ID No,Course / Scope,Class,Date,Status,Time / Mode',
       ...rows.map((r) =>
         [
           r.sn,
           this.escapeCsv(r.fullName),
           this.escapeCsv(r.matricOrAdmissionNo),
-          this.escapeCsv(subject.courseCode),
-          this.escapeCsv(subject.schoolClass.name),
+          this.escapeCsv(scope.displayCode),
+          this.escapeCsv(scope.className),
           this.escapeCsv(displayDate),
           r.status,
           this.escapeCsv(this.formatCsvTime(r.checkedInAt)),
@@ -1214,11 +1877,11 @@ export class AttendanceService {
         weekday,
       },
       subject: {
-        id: subject.id,
-        name: subject.name,
-        courseCode: subject.courseCode,
-        className: subject.schoolClass.name,
-        schoolName: subject.school?.name || 'School',
+        id: scope.subjectId || scope.classId,
+        name: scope.displayName,
+        courseCode: scope.displayCode,
+        className: scope.className,
+        schoolName: scope.schoolName,
       },
       stats: {
         totalStudents: rows.length,
@@ -1233,24 +1896,39 @@ export class AttendanceService {
   }
 
   /**
-   * 7. GET /attendance/subjects/:subjectId/report
-   * Full Term / Session Register Matrix + CSV export across all recorded dates
+   * 7. GET /attendance/subjects/:subjectId/report & /attendance/classes/:classId/report
    */
   async getTermAttendanceReport(
     userId: string,
     subjectId: string,
     termId?: string,
   ) {
-    const summary = await this.getSubjectAttendanceSummary(
-      subjectId,
+    const scope = await this.resolveSubjectScope(userId, subjectId);
+    return this.getTermAttendanceReportForScope(scope, termId);
+  }
+
+  async getClassTermAttendanceReport(
+    userId: string,
+    classId: string,
+    termId?: string,
+  ) {
+    const scope = await this.resolveClassScope(userId, classId, false);
+    return this.getTermAttendanceReportForScope(scope, termId);
+  }
+
+  private async getTermAttendanceReportForScope(
+    scope: AttendanceScope,
+    termId?: string,
+  ) {
+    const summary = await this.getAttendanceSummaryForScope(
+      scope,
       undefined,
-      userId,
       undefined,
       termId,
     );
 
     const sessionsAsc = await this.prisma.attendanceSession.findMany({
-      where: { subjectId },
+      where: this.buildSessionScopeWhere(scope),
       include: { records: true },
       orderBy: { sessionDate: 'asc' },
     });
@@ -1314,7 +1992,7 @@ export class AttendanceService {
       'S/N',
       'Student Name',
       'ID No',
-      'Course',
+      'Course / Scope',
       'Class',
       'Period',
       ...sessionColumns.map((c) => this.escapeCsv(c.label)),
@@ -1332,8 +2010,8 @@ export class AttendanceService {
         st.sn,
         this.escapeCsv(st.fullName),
         this.escapeCsv(st.matricOrAdmissionNo),
-        this.escapeCsv(summary.subject.courseCode),
-        this.escapeCsv(summary.subject.className),
+        this.escapeCsv(scope.displayCode),
+        this.escapeCsv(scope.className),
         this.escapeCsv(termLabel),
         ...sessionColumns.map((c) => st.byDate[c.id] || 'A'),
         st.presentCount,
@@ -1362,17 +2040,33 @@ export class AttendanceService {
 
   /**
    * 8. GET /attendance/subjects/:subjectId/students/:studentId
-   * Particular student's attendance breakdown & chronological Mon-Fri history + CSV export
+   * &  GET /attendance/classes/:classId/students/:studentId
    */
   async getStudentAttendanceDetail(
     userId: string,
     subjectId: string,
     studentId: string,
   ) {
-    const subject = await this.verifySubjectAccess(userId, subjectId);
+    const scope = await this.resolveSubjectScope(userId, subjectId);
+    return this.getStudentAttendanceDetailForScope(scope, studentId);
+  }
+
+  async getClassStudentAttendanceDetail(
+    userId: string,
+    classId: string,
+    studentId: string,
+  ) {
+    const scope = await this.resolveClassScope(userId, classId, false);
+    return this.getStudentAttendanceDetailForScope(scope, studentId);
+  }
+
+  private async getStudentAttendanceDetailForScope(
+    scope: AttendanceScope,
+    studentId: string,
+  ) {
     const [sessions, studentUser] = await Promise.all([
       this.prisma.attendanceSession.findMany({
-        where: { subjectId: subject.id },
+        where: this.buildSessionScopeWhere(scope),
         include: {
           records: { where: { studentId } },
         },
@@ -1397,11 +2091,7 @@ export class AttendanceService {
       throw new NotFoundException('Student not found.');
     }
 
-    const threshold =
-      subject.minAttendancePercent ??
-      subject.school?.defaultMinAttendancePercent ??
-      75;
-
+    const threshold = scope.defaultThreshold;
     let presentCount = 0;
     let lateCount = 0;
     let excusedCount = 0;
@@ -1441,14 +2131,18 @@ export class AttendanceService {
 
     const standingLabel = `${attendancePercent}% (${attendedCount}/${totalSessions} days)`;
     const csvLines = [
-      'S/N,Student Name,ID No,Class,Course,Day,Date,Status,Marked Time,Standing',
+      'S/N,Student Name,ID No,Class,Scope,Day,Date,Status,Marked Time,Standing',
       ...logs.map((l, idx) =>
         [
           idx + 1,
           this.escapeCsv(studentUser.fullName || 'Student'),
           this.escapeCsv(studentNo),
-          this.escapeCsv(subject.schoolClass.name),
-          this.escapeCsv(`${subject.courseCode} - ${subject.name}`),
+          this.escapeCsv(scope.className),
+          this.escapeCsv(
+            scope.mode === 'CLASS'
+              ? scope.displayName
+              : `${scope.displayCode} - ${scope.displayName}`,
+          ),
           this.escapeCsv(l.weekday),
           this.escapeCsv(this.formatCsvDisplayDate(l.sessionDate)),
           l.status,
@@ -1460,10 +2154,10 @@ export class AttendanceService {
 
     return {
       subject: {
-        id: subject.id,
-        name: subject.name,
-        courseCode: subject.courseCode,
-        className: subject.schoolClass.name,
+        id: scope.subjectId || scope.classId,
+        name: scope.displayName,
+        courseCode: scope.displayCode,
+        className: scope.className,
       },
       student: {
         studentId: studentUser.id,

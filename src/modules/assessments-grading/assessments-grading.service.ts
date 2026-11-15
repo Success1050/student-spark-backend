@@ -16,6 +16,20 @@ import {
 } from './calculators/gpa-cgpa.calculator.js';
 import { ReportCardRemarksAiService } from '../ai/services/report-card-remarks-ai.service.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
+import { LiveRankingsService } from './live-rankings.service.js';
+import {
+  normalizeStudentTraitRatings,
+  ReportCardMetaConfig,
+  ReportCardTraitsConfig,
+  sanitizeReportCardMeta,
+  sanitizeTraitsConfig,
+} from './calculators/report-card-traits.helper.js';
+import {
+  CalendarBreakKind,
+  computeTermCalendarMetrics,
+  parseUtcDateFromKey,
+  toUtcDateKey,
+} from './calculators/academic-calendar.helper.js';
 
 export interface SaveGradeEntryInput {
   studentId: string;
@@ -29,10 +43,13 @@ export interface UpsertConfigInput {
   examWeightTotal?: number;
   components?: AssessmentComponentConfig[];
   gradeScale?: GradeScaleBand[];
+  traitsConfig?: ReportCardTraitsConfig;
+  reportCardMeta?: ReportCardMetaConfig;
   gpaScaleMax?: number;
   applyToSchool?: boolean;
   overrideSubjects?: boolean;
   resetToSchoolDefault?: boolean;
+  termId?: string;
 }
 
 @Injectable()
@@ -43,6 +60,7 @@ export class AssessmentsGradingService {
     private readonly gpaCalculator: GpaCgpaCalculator,
     private readonly remarksAi: ReportCardRemarksAiService,
     private readonly notifications: NotificationsService,
+    private readonly liveRankings: LiveRankingsService,
   ) {}
 
   private isTertiaryInstitution(institutionType?: string | null): boolean {
@@ -105,6 +123,8 @@ export class AssessmentsGradingService {
             create: termNames.map((name, idx) => ({
               name,
               isCurrent: idx === 0,
+              isEnabled: idx === 0,
+              isClosed: false,
             })),
           },
         },
@@ -138,6 +158,8 @@ export class AssessmentsGradingService {
         sessionId: s.id,
         sessionName: s.name,
         isCurrent: t.isCurrent,
+        isEnabled: t.isCurrent ? true : Boolean((t as any).isEnabled),
+        isClosed: Boolean((t as any).isClosed),
         recordedCount: countMap.get(t.id) ?? 0,
       })),
     }));
@@ -231,6 +253,8 @@ export class AssessmentsGradingService {
           create: termNames.map((name, idx) => ({
             name,
             isCurrent: makeCurrent && idx === 0,
+            isEnabled: makeCurrent && idx === 0,
+            isClosed: false,
           })),
         },
       },
@@ -299,6 +323,8 @@ export class AssessmentsGradingService {
         sessionId: session.id,
         name: cleanName,
         isCurrent: makeCurrent,
+        isEnabled: makeCurrent,
+        isClosed: false,
       },
     });
 
@@ -310,7 +336,12 @@ export class AssessmentsGradingService {
     };
   }
 
-  async setActiveTerm(userId: string, schoolId: string, termId: string) {
+  async setActiveTerm(
+    userId: string,
+    schoolId: string,
+    termId: string,
+    closePreviousCurrent = false,
+  ) {
     await this.verifySchoolAdminAccess(userId, schoolId);
 
     const term = await this.prisma.academicTerm.findFirst({
@@ -324,30 +355,287 @@ export class AssessmentsGradingService {
       throw new NotFoundException('Academic term not found for this school.');
     }
 
-    await this.prisma.$transaction([
-      this.prisma.academicSession.updateMany({
+    await this.prisma.$transaction(async (tx) => {
+      if (closePreviousCurrent) {
+        await tx.academicTerm.updateMany({
+          where: {
+            session: { schoolId },
+            isCurrent: true,
+            id: { not: term.id },
+          },
+          data: { isClosed: true, isEnabled: true },
+        });
+      }
+      await tx.academicSession.updateMany({
         where: { schoolId },
         data: { isCurrent: false },
-      }),
-      this.prisma.academicTerm.updateMany({
+      });
+      await tx.academicTerm.updateMany({
         where: { session: { schoolId } },
         data: { isCurrent: false },
-      }),
-      this.prisma.academicSession.update({
+      });
+      await tx.academicSession.update({
         where: { id: term.sessionId },
         data: { isCurrent: true },
-      }),
-      this.prisma.academicTerm.update({
+      });
+      await tx.academicTerm.update({
         where: { id: term.id },
-        data: { isCurrent: true },
-      }),
-    ]);
+        data: {
+          isCurrent: true,
+          isEnabled: true,
+          isClosed: false,
+          ...(!term.startDate ? { startDate: new Date() } : {}),
+        },
+      });
+    });
 
     const all = await this.ensureDefaultTerms(schoolId);
     return {
       ...all,
-      message: `Active session set to ${term.session.name} (${term.name}).`,
+      message: closePreviousCurrent
+        ? `Previous term closed and active term switched to ${term.session.name} (${term.name}).`
+        : `Active session set to ${term.session.name} (${term.name}).`,
     };
+  }
+
+  async updateTermStatus(
+    userId: string,
+    schoolId: string,
+    termId: string,
+    dto: { isEnabled?: boolean; isClosed?: boolean },
+  ) {
+    await this.verifySchoolAdminAccess(userId, schoolId);
+
+    const term = await this.prisma.academicTerm.findFirst({
+      where: {
+        id: termId,
+        session: { schoolId },
+      },
+      include: { session: true },
+    });
+    if (!term) {
+      throw new NotFoundException('Academic term not found for this school.');
+    }
+
+    if (dto.isEnabled === false && term.isCurrent) {
+      throw new BadRequestException(
+        'Cannot disable the currently live term. Switch live term first before disabling this term.',
+      );
+    }
+
+    const nextClosed =
+      typeof dto.isClosed === 'boolean' ? dto.isClosed : term.isClosed;
+    const nextEnabled = nextClosed
+      ? true
+      : typeof dto.isEnabled === 'boolean'
+        ? dto.isEnabled
+        : term.isEnabled;
+
+    await this.prisma.academicTerm.update({
+      where: { id: term.id },
+      data: {
+        isEnabled: nextEnabled,
+        isClosed: nextClosed,
+      },
+    });
+
+    const all = await this.ensureDefaultTerms(schoolId);
+    let actionLabel = 'updated';
+    if (typeof dto.isClosed === 'boolean') {
+      actionLabel = dto.isClosed
+        ? 'officially closed — teacher edits are now locked (School Admin only)'
+        : 'reopened for teacher editing';
+    } else if (typeof dto.isEnabled === 'boolean') {
+      actionLabel = dto.isEnabled ? 'enabled for staff' : 'disabled';
+    }
+
+    return {
+      ...all,
+      message: `${term.name} (${term.session.name}) ${actionLabel}.`,
+    };
+  }
+
+  private async isUserSchoolAdmin(
+    userId: string | undefined,
+    schoolId: string,
+  ): Promise<boolean> {
+    if (!userId) return false;
+    const [user, membership] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { role: true, schoolId: true },
+      }),
+      this.prisma.membership.findFirst({
+        where: { userId, schoolId, status: 'ACTIVE' },
+        select: { role: true },
+      }),
+    ]);
+
+    if (!user) return false;
+    if (user.role === 'SUPER_ADMIN') return true;
+    if (user.role === 'SCHOOL_ADMIN' && (!user.schoolId || user.schoolId === schoolId)) {
+      return true;
+    }
+    if (membership && (membership.role === 'SCHOOL_ADMIN' || membership.role === 'SUPER_ADMIN')) {
+      return true;
+    }
+    return false;
+  }
+
+  private async assertTermEditableForUser(
+    userId: string | undefined,
+    schoolId: string,
+    termId: string,
+  ): Promise<{ isAdmin: boolean }> {
+    const [isAdmin, term] = await Promise.all([
+      this.isUserSchoolAdmin(userId, schoolId),
+      this.prisma.academicTerm.findUnique({
+        where: { id: termId },
+        select: { id: true, name: true, isCurrent: true, isEnabled: true, isClosed: true },
+      }),
+    ]);
+
+    if (!term) {
+      throw new NotFoundException('Academic term not found.');
+    }
+    if (isAdmin) {
+      return { isAdmin: true };
+    }
+    if (!term.isEnabled && !term.isCurrent) {
+      throw new ForbiddenException(
+        `${term.name} has not been enabled by your School Admin yet.`,
+      );
+    }
+    if (term.isClosed) {
+      throw new ForbiddenException(
+        `${term.name} has concluded and officially closed. Only the School Admin can modify records in a closed term.`,
+      );
+    }
+    return { isAdmin: false };
+  }
+
+  private async computeClassAttendanceBreakdown(
+    schoolId: string,
+    classId: string,
+    termId: string,
+    studentIds: string[],
+  ): Promise<
+    Map<
+      string,
+      {
+        present: number;
+        late: number;
+        absent: number;
+        excused: number;
+        totalMarkedDays: number;
+      }
+    >
+  > {
+    const result = new Map<
+      string,
+      {
+        present: number;
+        late: number;
+        absent: number;
+        excused: number;
+        totalMarkedDays: number;
+      }
+    >();
+    for (const sid of studentIds) {
+      result.set(sid, {
+        present: 0,
+        late: 0,
+        absent: 0,
+        excused: 0,
+        totalMarkedDays: 0,
+      });
+    }
+    if (studentIds.length === 0) return result;
+
+    const term = await this.prisma.academicTerm.findUnique({
+      where: { id: termId },
+      select: { startDate: true, endDate: true },
+    });
+
+    const dateFilter: { gte?: Date; lte?: Date } = {};
+    if (term?.startDate) {
+      const s = new Date(term.startDate);
+      s.setUTCHours(0, 0, 0, 0);
+      dateFilter.gte = s;
+    }
+    if (term?.endDate) {
+      const e = new Date(term.endDate);
+      e.setUTCHours(23, 59, 59, 999);
+      dateFilter.lte = e;
+    }
+
+    const sessions = await this.prisma.attendanceSession.findMany({
+      where: {
+        schoolId,
+        classId,
+        ...(dateFilter.gte || dateFilter.lte ? { sessionDate: dateFilter } : {}),
+      },
+      include: {
+        records: {
+          where: { studentId: { in: studentIds } },
+          select: { studentId: true, status: true },
+        },
+      },
+      orderBy: { sessionDate: 'asc' },
+    });
+
+    // Group attendance sessions by calendar date (YYYY-MM-DD) so each school day counts once per student
+    const byDate = new Map<string, typeof sessions>();
+    for (const sess of sessions) {
+      const key = sess.sessionDate.toISOString().slice(0, 10);
+      const list = byDate.get(key) || [];
+      list.push(sess);
+      byDate.set(key, list);
+    }
+
+    const statusWeight = (status: string) => {
+      if (status === 'PRESENT') return 4;
+      if (status === 'LATE') return 3;
+      if (status === 'EXCUSED') return 2;
+      return 1; // ABSENT
+    };
+
+    for (const daySessions of byDate.values()) {
+      const rollCallSessions = daySessions.filter((s) => !s.subjectId);
+      const sourceSessions =
+        rollCallSessions.length > 0 ? rollCallSessions : daySessions;
+
+      for (const sid of studentIds) {
+        let bestStatus: string | null = null;
+        for (const sess of sourceSessions) {
+          const rec = sess.records.find((r) => r.studentId === sid);
+          if (!rec) continue;
+          if (!bestStatus || statusWeight(rec.status) > statusWeight(bestStatus)) {
+            bestStatus = rec.status;
+          }
+        }
+        // Fallback if roll call existed for the day without this student, check subject sessions
+        if (!bestStatus && rollCallSessions.length > 0 && rollCallSessions.length < daySessions.length) {
+          for (const sess of daySessions) {
+            const rec = sess.records.find((r) => r.studentId === sid);
+            if (!rec) continue;
+            if (!bestStatus || statusWeight(rec.status) > statusWeight(bestStatus)) {
+              bestStatus = rec.status;
+            }
+          }
+        }
+
+        if (!bestStatus) continue;
+        const entry = result.get(sid)!;
+        entry.totalMarkedDays += 1;
+        if (bestStatus === 'PRESENT') entry.present += 1;
+        else if (bestStatus === 'LATE') entry.late += 1;
+        else if (bestStatus === 'EXCUSED') entry.excused += 1;
+        else entry.absent += 1;
+      }
+    }
+
+    return result;
   }
 
   private async resolveTermForSchool(schoolId: string, termId?: string) {
@@ -561,18 +849,75 @@ export class AssessmentsGradingService {
     );
   }
 
+  private parseFlexibleDateInput(input?: string | null): Date | null {
+    const raw = String(input ?? '').trim();
+    if (!raw) return null;
+    if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+      return parseUtcDateFromKey(raw.slice(0, 10));
+    }
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return null;
+    return parseUtcDateFromKey(toUtcDateKey(parsed));
+  }
+
+  private async resolveTermCalendarSummary(schoolId: string, termId?: string) {
+    const term = termId
+      ? await this.prisma.academicTerm.findFirst({
+          where: { id: termId, session: { schoolId } },
+          include: {
+            session: { select: { id: true, name: true } },
+            calendarEvents: { orderBy: [{ startDate: 'asc' }, { createdAt: 'asc' }] },
+          },
+        })
+      : await this.prisma.academicTerm.findFirst({
+          where: { session: { schoolId }, isCurrent: true },
+          include: {
+            session: { select: { id: true, name: true } },
+            calendarEvents: { orderBy: [{ startDate: 'asc' }, { createdAt: 'asc' }] },
+          },
+        });
+
+    if (!term) return null;
+
+    const metrics = computeTermCalendarMetrics({
+      createdAt: term.createdAt,
+      startDate: term.startDate,
+      endDate: term.endDate,
+      nextTermResumesDate: term.nextTermResumesDate,
+      events: term.calendarEvents.map((ev) => ({
+        id: ev.id,
+        title: ev.title,
+        type: ev.type,
+        startDate: ev.startDate,
+        endDate: ev.endDate,
+        description: ev.description,
+      })),
+    });
+
+    return {
+      termId: term.id,
+      termName: term.name,
+      sessionName: term.session?.name ?? null,
+      isCurrent: term.isCurrent,
+      ...metrics,
+    };
+  }
+
   async resolveAssessmentConfig(
     schoolId: string,
     subjectId?: string,
     institutionType?: string | null,
+    termId?: string,
   ) {
-    const subjectOverride = subjectId
-      ? await this.prisma.assessmentConfig.findUnique({ where: { subjectId } })
-      : null;
-
-    const schoolConfig = await this.prisma.assessmentConfig.findFirst({
-      where: { schoolId, subjectId: null },
-    });
+    const [subjectOverride, schoolConfig, calendarSummary] = await Promise.all([
+      subjectId
+        ? this.prisma.assessmentConfig.findUnique({ where: { subjectId } })
+        : Promise.resolve(null),
+      this.prisma.assessmentConfig.findFirst({
+        where: { schoolId, subjectId: null },
+      }),
+      this.resolveTermCalendarSummary(schoolId, termId),
+    ]);
 
     const configRecord = subjectOverride ?? schoolConfig;
     const gpaScaleMax = configRecord?.gpaScaleMax ?? 5.0;
@@ -587,12 +932,33 @@ export class AssessmentsGradingService {
         ? (configRecord.gradeScaleJson as unknown as GradeScaleBand[])
         : this.gpaCalculator.getDefaultScale(institutionType, gpaScaleMax);
 
+    const traitsConfig = sanitizeTraitsConfig(
+      schoolConfig?.traitsConfigJson ?? configRecord?.traitsConfigJson,
+      institutionType,
+    );
+    const storedMeta = sanitizeReportCardMeta(
+      schoolConfig?.reportCardMetaJson ?? configRecord?.reportCardMetaJson,
+    );
+    const reportCardMeta: ReportCardMetaConfig = calendarSummary
+      ? {
+          ...storedMeta,
+          daysSchoolOpened: calendarSummary.daysSchoolOpened,
+          vacationDate:
+            calendarSummary.formattedVacationDate ?? storedMeta.vacationDate,
+          resumptionDate:
+            calendarSummary.formattedResumptionDate ?? storedMeta.resumptionDate,
+        }
+      : storedMeta;
+
     return {
       caMode: scheme.caMode,
       caWeightTotal: scheme.caWeightTotal,
       examWeightTotal: scheme.examWeightTotal,
       components: scheme.components,
       gradeScale,
+      traitsConfig,
+      reportCardMeta,
+      calendarSummary,
       gpaScaleMax,
       totalMaxWeight: scheme.components.reduce(
         (acc, c) => acc + Number(c.maxScore || 0),
@@ -786,12 +1152,82 @@ export class AssessmentsGradingService {
       where: { schoolId, subjectId: null },
     });
 
+    const cleanTraitsConfig = dto.traitsConfig
+      ? sanitizeTraitsConfig(dto.traitsConfig, school.institutionType)
+      : existingSchoolDefault?.traitsConfigJson
+      ? sanitizeTraitsConfig(
+          existingSchoolDefault.traitsConfigJson,
+          school.institutionType,
+        )
+      : sanitizeTraitsConfig(null, school.institutionType);
+
+    const cleanReportCardMeta = dto.reportCardMeta
+      ? sanitizeReportCardMeta(dto.reportCardMeta)
+      : existingSchoolDefault?.reportCardMetaJson
+      ? sanitizeReportCardMeta(existingSchoolDefault.reportCardMetaJson)
+      : sanitizeReportCardMeta(null);
+
+    // Keep the active academic term's vacates / resumption dates in sync when
+    // saved from gradingSettings, and always auto-fill daysSchoolOpened from the calendar.
+    const activeTerm = await this.prisma.academicTerm.findFirst({
+      where: { session: { schoolId }, isCurrent: true },
+      select: { id: true },
+    });
+    if (activeTerm && dto.reportCardMeta) {
+      const parsedVac =
+        dto.reportCardMeta.vacationDate !== undefined
+          ? this.parseFlexibleDateInput(cleanReportCardMeta.vacationDate)
+          : undefined;
+      const parsedRes =
+        dto.reportCardMeta.resumptionDate !== undefined
+          ? this.parseFlexibleDateInput(cleanReportCardMeta.resumptionDate)
+          : undefined;
+      if (parsedVac !== undefined || parsedRes !== undefined) {
+        await this.prisma.academicTerm.update({
+          where: { id: activeTerm.id },
+          data: {
+            ...(dto.reportCardMeta.vacationDate !== undefined
+              ? {
+                  endDate: cleanReportCardMeta.vacationDate
+                    ? parsedVac ?? undefined
+                    : null,
+                }
+              : {}),
+            ...(dto.reportCardMeta.resumptionDate !== undefined
+              ? {
+                  nextTermResumesDate: cleanReportCardMeta.resumptionDate
+                    ? parsedRes ?? undefined
+                    : null,
+                }
+              : {}),
+          },
+        });
+      }
+    }
+
+    const latestCalendar = await this.resolveTermCalendarSummary(
+      schoolId,
+      activeTerm?.id,
+    );
+    if (latestCalendar) {
+      cleanReportCardMeta.daysSchoolOpened = latestCalendar.daysSchoolOpened;
+      if (latestCalendar.formattedVacationDate) {
+        cleanReportCardMeta.vacationDate = latestCalendar.formattedVacationDate;
+      }
+      if (latestCalendar.formattedResumptionDate) {
+        cleanReportCardMeta.resumptionDate =
+          latestCalendar.formattedResumptionDate;
+      }
+    }
+
     const saved = existingSchoolDefault
       ? await this.prisma.assessmentConfig.update({
           where: { id: existingSchoolDefault.id },
           data: {
             componentsJson: cleanScheme as any,
             gradeScaleJson: resolvedScale as any,
+            traitsConfigJson: cleanTraitsConfig as any,
+            reportCardMetaJson: cleanReportCardMeta as any,
             gpaScaleMax,
           },
         })
@@ -801,6 +1237,8 @@ export class AssessmentsGradingService {
             subjectId: null,
             componentsJson: cleanScheme as any,
             gradeScaleJson: resolvedScale as any,
+            traitsConfigJson: cleanTraitsConfig as any,
+            reportCardMetaJson: cleanReportCardMeta as any,
             gpaScaleMax,
           },
         });
@@ -831,6 +1269,8 @@ export class AssessmentsGradingService {
     dto: UpsertConfigInput,
   ) {
     const subject = await this.verifySubjectAccess(userId, subjectId);
+    const { term } = await this.resolveTermForSchool(subject.schoolId, dto.termId);
+    await this.assertTermEditableForUser(userId, subject.schoolId, term.id);
 
     if (dto.resetToSchoolDefault) {
       await this.prisma.assessmentConfig.deleteMany({
@@ -883,8 +1323,7 @@ export class AssessmentsGradingService {
       subject.school.institutionType,
     );
 
-    // Recompute any existing saved scores in the current term under the updated slots/weights
-    const { term } = await this.resolveTermForSchool(subject.schoolId);
+    // Recompute any existing saved scores in the resolved term under the updated slots/weights
     await this.recomputeAndRankSubjectTerm(this.prisma, subject, term.id, updatedConfig);
 
     return {
@@ -989,6 +1428,9 @@ export class AssessmentsGradingService {
     const subject = await this.verifySubjectAccess(userId, subjectId);
     const { term, terms, sessions: schoolSessions } =
       await this.resolveTermForSchool(subject.schoolId, termId);
+    const isAdmin = await this.isUserSchoolAdmin(userId, subject.schoolId);
+    const canEdit =
+      isAdmin || (!term.isClosed && (term.isEnabled || term.isCurrent));
     const config = await this.resolveAssessmentConfig(
       subject.schoolId,
       subject.id,
@@ -1094,6 +1536,7 @@ export class AssessmentsGradingService {
       term,
       terms,
       sessions: schoolSessions,
+      canEdit,
       config,
       stats: {
         totalStudents: rows.length,
@@ -1123,6 +1566,7 @@ export class AssessmentsGradingService {
   ) {
     const subject = await this.verifySubjectAccess(userId, subjectId);
     const { term } = await this.resolveTermForSchool(subject.schoolId, dto.termId);
+    await this.assertTermEditableForUser(userId, subject.schoolId, term.id);
     const config = await this.resolveAssessmentConfig(
       subject.schoolId,
       subject.id,
@@ -1132,6 +1576,8 @@ export class AssessmentsGradingService {
     if (!Array.isArray(dto.entries) || dto.entries.length === 0) {
       throw new BadRequestException('No student score entries provided.');
     }
+
+    await this.liveRankings.captureBaselineSnapshot(subject.schoolId, term.id);
 
     await this.prisma.$transaction(async (tx) => {
       for (const entry of dto.entries) {
@@ -1172,6 +1618,18 @@ export class AssessmentsGradingService {
     // Keep class TerminalReportCard broadsheet & GPA/CGPA synchronized
     await this.computeClassBroadsheetAndPositions(subject.classId, term.id, userId);
 
+    // Broadcast real-time SofaScore-style live ranking updates via WebSocket
+    await this.liveRankings.broadcastScoreMutation({
+      schoolId: subject.schoolId,
+      termId: term.id,
+      eventType: 'GRADES_SAVED',
+      subjectId: subject.id,
+      subjectName: subject.name,
+      classId: subject.classId,
+      className: subject.schoolClass?.name,
+      updatedCount: dto.entries.length,
+    });
+
     const updated = await this.getSubjectGradebook(userId, subject.id, term.id);
     return {
       message: `Saved ${dto.entries.length} student grade(s) and updated class positions.`,
@@ -1189,6 +1647,7 @@ export class AssessmentsGradingService {
   ) {
     const subject = await this.verifySubjectAccess(userId, subjectId);
     const { term } = await this.resolveTermForSchool(subject.schoolId, dto.termId);
+    await this.assertTermEditableForUser(userId, subject.schoolId, term.id);
     const config = await this.resolveAssessmentConfig(
       subject.schoolId,
       subject.id,
@@ -1265,6 +1724,9 @@ export class AssessmentsGradingService {
   ) {
     const schoolClass = await this.verifyClassAccess(userId, classId);
     const { term, terms, sessions } = await this.resolveTermForSchool(schoolClass.schoolId, termId);
+    const isAdmin = await this.isUserSchoolAdmin(userId, schoolClass.schoolId);
+    const canEdit =
+      isAdmin || (!term.isClosed && (term.isEnabled || term.isCurrent));
     const config = await this.resolveAssessmentConfig(
       schoolClass.schoolId,
       undefined,
@@ -1355,7 +1817,7 @@ export class AssessmentsGradingService {
 
       const termGpaSummary = this.gpaCalculator.calculateTermGpa(
         studentTermGrades.map((g) => ({
-          creditUnits: g.subject?.creditUnits ?? 3,
+          creditUnits: g.subject?.creditUnits ?? 1,
           totalScore: g.totalScore,
           gradePoint: g.gradePoint,
         })),
@@ -1364,7 +1826,7 @@ export class AssessmentsGradingService {
 
       const cumulativeSummary = this.gpaCalculator.calculateCumulativeCgpa(
         studentCumulativeGrades.map((g) => ({
-          creditUnits: g.subject?.creditUnits ?? 3,
+          creditUnits: g.subject?.creditUnits ?? 1,
           totalScore: g.totalScore,
           gradePoint: g.gradePoint,
         })),
@@ -1530,6 +1992,7 @@ export class AssessmentsGradingService {
       term,
       terms,
       sessions,
+      canEdit,
       gpaScaleMax: config.gpaScaleMax,
       subjects: schoolClass.subjects.map((s) => ({
         id: s.id,
@@ -1605,6 +2068,11 @@ export class AssessmentsGradingService {
     });
 
     if (dto.saveImmediately) {
+      await this.assertTermEditableForUser(
+        userId,
+        broadsheet.school.id,
+        broadsheet.term.id,
+      );
       await this.prisma.terminalReportCard.updateMany({
         where: {
           classId,
@@ -1640,6 +2108,7 @@ export class AssessmentsGradingService {
   ) {
     const schoolClass = await this.verifyClassAccess(userId, classId);
     const { term } = await this.resolveTermForSchool(schoolClass.schoolId, dto.termId);
+    await this.assertTermEditableForUser(userId, schoolClass.schoolId, term.id);
 
     const updateData: { teacherRemark?: string | null; principalRemark?: string | null } = {};
     if (dto.teacherRemark !== undefined) {
@@ -1688,6 +2157,11 @@ export class AssessmentsGradingService {
       classId,
       dto.termId,
       userId,
+    );
+    await this.assertTermEditableForUser(
+      userId,
+      broadsheet.school.id,
+      broadsheet.term.id,
     );
 
     const targets = broadsheet.rows.filter(
@@ -1761,7 +2235,16 @@ export class AssessmentsGradingService {
       throw new NotFoundException('Student report card not found in this class.');
     }
 
-    const [schoolMeta, studentUser, subjectGrades] = await Promise.all([
+    const [
+      schoolMeta,
+      studentUser,
+      subjectGrades,
+      allClassGrades,
+      classSubjects,
+      reportCardRec,
+      resolvedConfig,
+      attendanceBreakdownMap,
+    ] = await Promise.all([
       this.prisma.school.findUnique({
         where: { id: broadsheet.school.id },
         select: {
@@ -1781,6 +2264,8 @@ export class AssessmentsGradingService {
           id: true,
           fullName: true,
           email: true,
+          loginId: true,
+          studentCode: true,
           studentProfile: {
             select: { matricOrAdmissionNo: true, level: true },
           },
@@ -1799,7 +2284,70 @@ export class AssessmentsGradingService {
         },
         orderBy: { subject: { name: 'asc' } },
       }),
+      this.prisma.studentSubjectGrade.groupBy({
+        by: ['subjectId'],
+        where: { classId, termId: broadsheet.term.id },
+        _avg: { totalScore: true },
+      }),
+      this.prisma.schoolSubject.findMany({
+        where: { schoolId: broadsheet.school.id, classId },
+        select: { id: true, name: true, courseCode: true, creditUnits: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.terminalReportCard.findUnique({
+        where: {
+          termId_classId_studentId: {
+            termId: broadsheet.term.id,
+            classId,
+            studentId,
+          },
+        },
+        select: { traitRatingsJson: true },
+      }),
+      this.resolveAssessmentConfig(
+        broadsheet.school.id,
+        undefined,
+        broadsheet.school.institutionType,
+        broadsheet.term.id,
+      ),
+      this.computeClassAttendanceBreakdown(
+        broadsheet.school.id,
+        classId,
+        broadsheet.term.id,
+        [studentId],
+      ),
     ]);
+
+    const classAvgBySubj = new Map<string, number>(
+      allClassGrades.map((g) => [
+        g.subjectId,
+        Math.round((Number(g._avg?.totalScore) || 0) * 10) / 10,
+      ]),
+    );
+    const normalizedTraitRatings = normalizeStudentTraitRatings(
+      reportCardRec?.traitRatingsJson,
+    );
+    const autoAttendance = attendanceBreakdownMap.get(studentId) ?? {
+      present: 0,
+      late: 0,
+      absent: 0,
+      excused: 0,
+      totalMarkedDays: 0,
+    };
+    const traitRatings = {
+      ...normalizedTraitRatings,
+      daysPresent: normalizedTraitRatings.daysPresent ?? autoAttendance.present,
+      daysLate: normalizedTraitRatings.daysLate ?? autoAttendance.late,
+      daysAbsent: normalizedTraitRatings.daysAbsent ?? autoAttendance.absent,
+      daysExcused: normalizedTraitRatings.daysExcused ?? autoAttendance.excused,
+      attendanceAuto: autoAttendance,
+    };
+
+    const resolvedUniqueId =
+      studentUser?.studentProfile?.matricOrAdmissionNo ||
+      studentUser?.loginId ||
+      studentUser?.studentCode ||
+      row.matricOrAdmissionNo;
 
     return {
       school: {
@@ -1817,13 +2365,23 @@ export class AssessmentsGradingService {
       },
       term: broadsheet.term,
       gpaScaleMax: broadsheet.gpaScaleMax,
+      assessmentConfig: {
+        caMode: resolvedConfig.caMode,
+        caWeightTotal: resolvedConfig.caWeightTotal,
+        examWeightTotal: resolvedConfig.examWeightTotal,
+        components: resolvedConfig.components,
+        gradeScale: resolvedConfig.gradeScale,
+        traitsConfig: resolvedConfig.traitsConfig,
+        reportCardMeta: resolvedConfig.reportCardMeta,
+      },
+      traitRatings,
       student: {
         studentId,
         fullName: studentUser?.fullName || row.fullName,
         email: studentUser?.email || null,
-        matricOrAdmissionNo:
-          studentUser?.studentProfile?.matricOrAdmissionNo ||
-          row.matricOrAdmissionNo,
+        matricOrAdmissionNo: resolvedUniqueId,
+        loginId: studentUser?.loginId ?? null,
+        studentCode: studentUser?.studentCode ?? null,
         level: studentUser?.studentProfile?.level || broadsheet.schoolClass.levelCode || null,
       },
       summary: {
@@ -1843,19 +2401,357 @@ export class AssessmentsGradingService {
         principalRemark: row.principalRemark ?? null,
         published: row.published,
       },
-      subjectGrades: subjectGrades.map((sg) => ({
-        subjectId: sg.subjectId,
-        name: sg.subject.name,
-        courseCode: sg.subject.courseCode,
-        creditUnits: sg.subject.creditUnits,
-        scoresJson: sg.scoresJson,
-        totalScore: sg.totalScore,
-        letterGrade: sg.letterGrade,
-        gradePoint: sg.gradePoint,
-        subjectPosition: sg.subjectPosition,
-        subjectOrdinal: sg.subjectOrdinal,
-        teacherComment: sg.teacherComment,
-      })),
+      subjectGrades: (() => {
+        const gradeBySubj = new Map(subjectGrades.map((sg) => [sg.subjectId, sg]));
+        const merged = classSubjects.map((subj) => {
+          const sg = gradeBySubj.get(subj.id);
+          if (sg) {
+            return {
+              subjectId: sg.subjectId,
+              name: sg.subject.name,
+              courseCode: sg.subject.courseCode,
+              creditUnits: sg.subject.creditUnits,
+              scoresJson: sg.scoresJson,
+              totalScore: sg.totalScore,
+              classAverage: classAvgBySubj.get(sg.subjectId) ?? null,
+              letterGrade: sg.letterGrade,
+              gradePoint: sg.gradePoint,
+              subjectPosition: sg.subjectPosition,
+              subjectOrdinal: sg.subjectOrdinal,
+              teacherComment: sg.teacherComment,
+              isRecorded: true,
+            };
+          }
+          return {
+            subjectId: subj.id,
+            name: subj.name,
+            courseCode: subj.courseCode,
+            creditUnits: subj.creditUnits,
+            scoresJson: {},
+            totalScore: null,
+            classAverage: classAvgBySubj.get(subj.id) ?? null,
+            letterGrade: null,
+            gradePoint: null,
+            subjectPosition: null,
+            subjectOrdinal: null,
+            teacherComment: null,
+            isRecorded: false,
+          };
+        });
+        const classSubjIds = new Set(classSubjects.map((s) => s.id));
+        for (const sg of subjectGrades) {
+          if (!classSubjIds.has(sg.subjectId)) {
+            merged.push({
+              subjectId: sg.subjectId,
+              name: sg.subject.name,
+              courseCode: sg.subject.courseCode,
+              creditUnits: sg.subject.creditUnits,
+              scoresJson: sg.scoresJson,
+              totalScore: sg.totalScore,
+              classAverage: classAvgBySubj.get(sg.subjectId) ?? null,
+              letterGrade: sg.letterGrade,
+              gradePoint: sg.gradePoint,
+              subjectPosition: sg.subjectPosition,
+              subjectOrdinal: sg.subjectOrdinal,
+              teacherComment: sg.teacherComment,
+              isRecorded: true,
+            });
+          }
+        }
+        return merged;
+      })(),
+    };
+  }
+
+  /**
+   * Fetch School's Configurable Qualities / Affective & Psychomotor Traits +
+   * Student Ratings in a Class (so Teachers can tick & grade students per quality).
+   */
+  async getClassTraitRatings(
+    userId: string,
+    classId: string,
+    termId?: string,
+  ) {
+    const schoolClass = await this.verifyClassAccess(userId, classId);
+    const { term, terms } = await this.resolveTermForSchool(
+      schoolClass.schoolId,
+      termId,
+    );
+    const isAdmin = await this.isUserSchoolAdmin(userId, schoolClass.schoolId);
+    const canEdit =
+      isAdmin || (!term.isClosed && (term.isEnabled || term.isCurrent));
+    const config = await this.resolveAssessmentConfig(
+      schoolClass.schoolId,
+      undefined,
+      schoolClass.school.institutionType,
+      term.id,
+    );
+
+    const [enrollments, profiles, legacyUsers, reportCards] = await Promise.all([
+      this.prisma.classEnrollment.findMany({
+        where: { classId },
+        include: {
+          student: {
+            select: {
+              id: true,
+              fullName: true,
+              avatarUrl: true,
+              loginId: true,
+              studentCode: true,
+              studentProfile: { select: { matricOrAdmissionNo: true } },
+            },
+          },
+        },
+      }),
+      this.prisma.studentProfile.findMany({
+        where: { classId },
+        include: {
+          user: {
+            select: {
+              id: true,
+              fullName: true,
+              avatarUrl: true,
+              loginId: true,
+              studentCode: true,
+            },
+          },
+        },
+      }),
+      this.prisma.user.findMany({
+        where: { classId, role: 'STUDENT' },
+        select: {
+          id: true,
+          fullName: true,
+          avatarUrl: true,
+          loginId: true,
+          studentCode: true,
+          studentProfile: { select: { matricOrAdmissionNo: true } },
+        },
+      }),
+      this.prisma.terminalReportCard.findMany({
+        where: { classId, termId: term.id },
+      }),
+    ]);
+
+    const studentMap = new Map<
+      string,
+      {
+        studentId: string;
+        fullName: string;
+        avatarUrl: string | null;
+        matricOrAdmissionNo: string;
+      }
+    >();
+
+    for (const e of enrollments) {
+      studentMap.set(e.student.id, {
+        studentId: e.student.id,
+        fullName: e.student.fullName || 'Student',
+        avatarUrl: e.student.avatarUrl,
+        matricOrAdmissionNo:
+          e.student.studentProfile?.matricOrAdmissionNo ||
+          e.student.loginId ||
+          e.student.studentCode ||
+          '—',
+      });
+    }
+    for (const p of profiles) {
+      if (!studentMap.has(p.user.id)) {
+        studentMap.set(p.user.id, {
+          studentId: p.user.id,
+          fullName: p.user.fullName || 'Student',
+          avatarUrl: p.user.avatarUrl,
+          matricOrAdmissionNo:
+            p.matricOrAdmissionNo ||
+            p.user.loginId ||
+            p.user.studentCode ||
+            '—',
+        });
+      }
+    }
+    for (const u of legacyUsers) {
+      if (!studentMap.has(u.id)) {
+        studentMap.set(u.id, {
+          studentId: u.id,
+          fullName: u.fullName || 'Student',
+          avatarUrl: u.avatarUrl,
+          matricOrAdmissionNo:
+            u.studentProfile?.matricOrAdmissionNo ||
+            u.loginId ||
+            u.studentCode ||
+            '—',
+        });
+      }
+    }
+
+    const attendanceByStudent = await this.computeClassAttendanceBreakdown(
+      schoolClass.schoolId,
+      classId,
+      term.id,
+      Array.from(studentMap.keys()),
+    );
+
+    const rcByStudent = new Map(reportCards.map((rc) => [rc.studentId, rc]));
+    const totalTraitsCount = config.traitsConfig.categories.reduce(
+      (acc, cat) => acc + cat.items.length,
+      0,
+    );
+
+    const students = Array.from(studentMap.values())
+      .map((s) => {
+        const rc = rcByStudent.get(s.studentId);
+        const norm = normalizeStudentTraitRatings(rc?.traitRatingsJson);
+        const auto = attendanceByStudent.get(s.studentId) ?? {
+          present: 0,
+          late: 0,
+          absent: 0,
+          excused: 0,
+          totalMarkedDays: 0,
+        };
+        const ratedCount = config.traitsConfig.categories
+          .flatMap((c) => c.items)
+          .filter((it) => Boolean(norm.ratings[it.key])).length;
+
+        return {
+          ...s,
+          overallAverage: rc?.overallAverage ?? 0,
+          overallOrdinal: rc?.overallOrdinal ?? null,
+          teacherRemark: rc?.teacherRemark ?? null,
+          principalRemark: rc?.principalRemark ?? null,
+          ratings: norm.ratings,
+          daysPresent: norm.daysPresent ?? auto.present,
+          daysLate: norm.daysLate ?? auto.late,
+          daysAbsent: norm.daysAbsent ?? auto.absent,
+          daysExcused: norm.daysExcused ?? auto.excused,
+          attendanceAuto: auto,
+          isAttendanceAuto:
+            norm.daysPresent === null &&
+            norm.daysLate === null &&
+            norm.daysAbsent === null &&
+            norm.daysExcused === null,
+          ratedCount,
+          totalTraitsCount,
+          updatedAt: norm.updatedAt ?? null,
+        };
+      })
+      .sort((a, b) => a.fullName.localeCompare(b.fullName));
+
+    return {
+      school: {
+        id: schoolClass.school.id,
+        name: schoolClass.school.name,
+        institutionType: schoolClass.school.institutionType,
+        isTertiary: this.isTertiaryInstitution(
+          schoolClass.school.institutionType,
+        ),
+      },
+      schoolClass: {
+        id: schoolClass.id,
+        name: schoolClass.name,
+        levelCode: schoolClass.levelCode,
+        departmentName: schoolClass.department?.name ?? null,
+      },
+      term,
+      terms,
+      canEdit,
+      traitsConfig: config.traitsConfig,
+      reportCardMeta: config.reportCardMeta,
+      students,
+    };
+  }
+
+  /**
+   * Teacher / Form Teacher / Admin ticks and saves a student's Affective & Psychomotor Qualities
+   */
+  async updateStudentTraitRatings(
+    userId: string,
+    classId: string,
+    studentId: string,
+    dto: {
+      termId?: string;
+      ratings: Record<string, string>;
+      daysPresent?: number | null;
+      daysLate?: number | null;
+      daysAbsent?: number | null;
+      daysExcused?: number | null;
+      teacherRemark?: string | null;
+    },
+  ) {
+    const schoolClass = await this.verifyClassAccess(userId, classId);
+    const { term } = await this.resolveTermForSchool(
+      schoolClass.schoolId,
+      dto.termId,
+    );
+    await this.assertTermEditableForUser(userId, schoolClass.schoolId, term.id);
+
+    const rater = userId
+      ? await this.prisma.user.findUnique({
+          where: { id: userId },
+          select: { fullName: true },
+        })
+      : null;
+
+    const cleanRatings: Record<string, string> = {};
+    if (dto.ratings && typeof dto.ratings === 'object') {
+      for (const [k, v] of Object.entries(dto.ratings)) {
+        if (v !== undefined && v !== null && String(v).trim() !== '') {
+          cleanRatings[k] = String(v).trim();
+        }
+      }
+    }
+
+    const clampDays = (val: number | null | undefined): number | null =>
+      val !== undefined && val !== null && Number.isFinite(Number(val))
+        ? Math.max(0, Math.min(365, Math.round(Number(val))))
+        : null;
+
+    const payload = {
+      ratings: cleanRatings,
+      daysPresent: clampDays(dto.daysPresent),
+      daysLate: clampDays(dto.daysLate),
+      daysAbsent: clampDays(dto.daysAbsent),
+      daysExcused: clampDays(dto.daysExcused),
+      ratedByName: rater?.fullName || null,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const existing = await this.prisma.terminalReportCard.findUnique({
+      where: {
+        termId_classId_studentId: { termId: term.id, classId, studentId },
+      },
+    });
+
+    const saved = existing
+      ? await this.prisma.terminalReportCard.update({
+          where: { id: existing.id },
+          data: {
+            traitRatingsJson: payload as any,
+            teacherRemark:
+              dto.teacherRemark !== undefined
+                ? dto.teacherRemark?.trim() || null
+                : undefined,
+          },
+        })
+      : await this.prisma.terminalReportCard.create({
+          data: {
+            schoolId: schoolClass.schoolId,
+            termId: term.id,
+            classId,
+            studentId,
+            traitRatingsJson: payload as any,
+            teacherRemark:
+              dto.teacherRemark !== undefined
+                ? dto.teacherRemark?.trim() || null
+                : null,
+          },
+        });
+
+    return {
+      message: 'Student quality & conduct ratings saved.',
+      studentId,
+      termId: term.id,
+      traitRatings: normalizeStudentTraitRatings(saved.traitRatingsJson),
+      teacherRemark: saved.teacherRemark,
     };
   }
 
@@ -1871,6 +2767,11 @@ export class AssessmentsGradingService {
       classId,
       dto.termId,
       userId,
+    );
+    await this.assertTermEditableForUser(
+      userId,
+      broadsheet.school.id,
+      broadsheet.term.id,
     );
 
     await this.prisma.terminalReportCard.updateMany({
@@ -1918,6 +2819,15 @@ export class AssessmentsGradingService {
         (r) => r.status === 'fulfilled' && r.value !== null,
       ).length;
     }
+
+    await this.liveRankings.broadcastScoreMutation({
+      schoolId: broadsheet.school.id,
+      termId: broadsheet.term.id,
+      eventType: 'RESULTS_PUBLISHED',
+      classId,
+      className: broadsheet.schoolClass.name,
+      updatedCount: broadsheet.rows.length,
+    });
 
     return {
       message: dto.published
@@ -1987,7 +2897,9 @@ export class AssessmentsGradingService {
     );
 
     const { term, terms, sessions } = await this.resolveTermForSchool(user.schoolId, termId);
-    const [reportCards, subjectGrades] = await Promise.all([
+    const effectiveClassId = user.studentProfile?.classId || user.classId || null;
+
+    const [reportCards, subjectGrades, offeredSubjects] = await Promise.all([
       this.prisma.terminalReportCard.findMany({
         where: {
           studentId: studentUserId,
@@ -2012,31 +2924,65 @@ export class AssessmentsGradingService {
         },
         orderBy: { subject: { name: 'asc' } },
       }),
+      effectiveClassId
+        ? this.prisma.schoolSubject.findMany({
+            where: {
+              schoolId: user.schoolId,
+              classId: effectiveClassId,
+            },
+            select: { id: true, name: true, courseCode: true, creditUnits: true },
+            orderBy: { name: 'asc' },
+          })
+        : Promise.resolve([]),
     ]);
 
     const currentPublishedCard = reportCards.find((rc) => rc.termId === term.id) ?? null;
+    const targetClassId = currentPublishedCard?.classId || effectiveClassId;
+    const classSubjects =
+      targetClassId && targetClassId !== effectiveClassId
+        ? await this.prisma.schoolSubject.findMany({
+            where: { schoolId: user.schoolId, classId: targetClassId },
+            select: { id: true, name: true, courseCode: true, creditUnits: true },
+            orderBy: { name: 'asc' },
+          })
+        : offeredSubjects;
 
     let classTotalStudents = 0;
+    let studentClassAvgs = new Map<string, number>();
     if (currentPublishedCard?.classId) {
-      classTotalStudents = await this.prisma.terminalReportCard.count({
-        where: {
-          classId: currentPublishedCard.classId,
-          termId: term.id,
-        },
-      });
+      const [cnt, classSubjAvgs] = await Promise.all([
+        this.prisma.terminalReportCard.count({
+          where: {
+            classId: currentPublishedCard.classId,
+            termId: term.id,
+          },
+        }),
+        this.prisma.studentSubjectGrade.groupBy({
+          by: ['subjectId'],
+          where: {
+            classId: currentPublishedCard.classId,
+            termId: term.id,
+          },
+          _avg: { totalScore: true },
+        }),
+      ]);
+      classTotalStudents = cnt;
+      studentClassAvgs = new Map(
+        classSubjAvgs.map((g) => [
+          g.subjectId,
+          Math.round((Number(g._avg?.totalScore) || 0) * 10) / 10,
+        ]),
+      );
     }
 
-    const standing = currentPublishedCard?.cgpa
-      ? this.gpaCalculator.classifyStanding(
-          currentPublishedCard.cgpa,
-          config.gpaScaleMax,
-          school?.institutionType,
-        )
-      : this.gpaCalculator.classifyStanding(
-          user.studentProfile?.cgpa ?? 0,
-          config.gpaScaleMax,
-          school?.institutionType,
-        );
+    const standing = this.gpaCalculator.resolveStanding(
+      currentPublishedCard?.cgpa ?? user.studentProfile?.cgpa ?? 0,
+      config.gpaScaleMax,
+    );
+
+    const traitRatings = normalizeStudentTraitRatings(
+      currentPublishedCard?.traitRatingsJson,
+    );
 
     return {
       hasSchool: true,
@@ -2071,6 +3017,16 @@ export class AssessmentsGradingService {
       terms,
       sessions,
       gpaScaleMax: config.gpaScaleMax,
+      assessmentConfig: {
+        caMode: config.caMode,
+        caWeightTotal: config.caWeightTotal,
+        examWeightTotal: config.examWeightTotal,
+        components: config.components,
+        gradeScale: config.gradeScale,
+        traitsConfig: config.traitsConfig,
+        reportCardMeta: config.reportCardMeta,
+      },
+      traitRatings,
       classTotalStudents,
       standing,
       profileSummary: {
@@ -2080,8 +3036,56 @@ export class AssessmentsGradingService {
       },
       currentReportCard: currentPublishedCard,
       publishedCards: reportCards,
-      // Only expose subject breakdown once class result for that term is published
-      subjectGrades: currentPublishedCard ? subjectGrades : [],
+      // Expose all subjects the student offers once published, marking unrecorded scores with null ("—")
+      subjectGrades: currentPublishedCard
+        ? (() => {
+            const gradeBySubj = new Map(subjectGrades.map((sg) => [sg.subjectId, sg]));
+            const merged: any[] = classSubjects.map((subj) => {
+              const sg = gradeBySubj.get(subj.id);
+              if (sg) {
+                return {
+                  ...sg,
+                  classAverage: studentClassAvgs.get(sg.subjectId) ?? null,
+                  isRecorded: true,
+                };
+              }
+              return {
+                id: `unrecorded-${subj.id}`,
+                studentId: studentUserId,
+                schoolId: user.schoolId,
+                classId: targetClassId,
+                termId: term.id,
+                subjectId: subj.id,
+                scoresJson: {},
+                totalScore: null,
+                letterGrade: null,
+                gradePoint: null,
+                subjectPosition: null,
+                subjectOrdinal: null,
+                teacherComment: null,
+                classAverage: studentClassAvgs.get(subj.id) ?? null,
+                isRecorded: false,
+                subject: {
+                  id: subj.id,
+                  name: subj.name,
+                  courseCode: subj.courseCode,
+                  creditUnits: subj.creditUnits,
+                },
+              };
+            });
+            const seen = new Set(classSubjects.map((s) => s.id));
+            for (const sg of subjectGrades) {
+              if (!seen.has(sg.subjectId)) {
+                merged.push({
+                  ...sg,
+                  classAverage: studentClassAvgs.get(sg.subjectId) ?? null,
+                  isRecorded: true,
+                });
+              }
+            }
+            return merged;
+          })()
+        : [],
     };
   }
 
@@ -2587,5 +3591,354 @@ export class AssessmentsGradingService {
       gradeDistribution,
       termFormTrend,
     };
+  }
+
+  // ============================================================================
+  // SCHOOL ACADEMIC CALENDAR (TERM DATES, HOLIDAYS & MID-TERM BREAKS)
+  // ============================================================================
+
+  async getSchoolAcademicCalendar(
+    userId: string,
+    schoolId: string,
+    termId?: string,
+  ) {
+    const [school, user] = await Promise.all([
+      this.prisma.school.findUnique({
+        where: { id: schoolId },
+        select: { id: true, name: true, institutionType: true },
+      }),
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, role: true, schoolId: true },
+      }),
+    ]);
+
+    if (!school) {
+      throw new NotFoundException('Institution not found.');
+    }
+    if (!user) {
+      throw new ForbiddenException('Authenticated user not found.');
+    }
+    if (
+      user.role !== 'SUPER_ADMIN' &&
+      user.schoolId &&
+      user.schoolId !== schoolId
+    ) {
+      throw new ForbiddenException('Access denied to another institution.');
+    }
+
+    await this.ensureDefaultTerms(schoolId);
+
+    const sessions = await this.prisma.academicSession.findMany({
+      where: { schoolId },
+      orderBy: [{ isCurrent: 'desc' }, { createdAt: 'desc' }],
+      include: {
+        terms: {
+          orderBy: { createdAt: 'asc' },
+          include: {
+            calendarEvents: {
+              orderBy: [{ startDate: 'asc' }, { createdAt: 'asc' }],
+            },
+          },
+        },
+      },
+    });
+
+    const allTerms = sessions.flatMap((s) =>
+      s.terms.map((t) => ({ ...t, sessionName: s.name })),
+    );
+    const activeTerm = allTerms.find((t) => t.isCurrent) ?? allTerms[0] ?? null;
+    const selectedTerm =
+      (termId ? allTerms.find((t) => t.id === termId) : null) ??
+      activeTerm;
+
+    if (!selectedTerm) {
+      throw new NotFoundException('No academic term configured for this institution.');
+    }
+
+    const events = selectedTerm.calendarEvents.map((ev) => ({
+      id: ev.id,
+      termId: ev.termId,
+      title: ev.title,
+      type: ev.type as CalendarBreakKind,
+      startDate: toUtcDateKey(ev.startDate),
+      endDate: toUtcDateKey(ev.endDate),
+      description: ev.description ?? null,
+      createdAt: ev.createdAt,
+    }));
+
+    const metrics = computeTermCalendarMetrics({
+      createdAt: selectedTerm.createdAt,
+      startDate: selectedTerm.startDate,
+      endDate: selectedTerm.endDate,
+      nextTermResumesDate: selectedTerm.nextTermResumesDate,
+      events,
+    });
+
+    const canEdit =
+      user.role === 'SCHOOL_ADMIN' || user.role === 'SUPER_ADMIN';
+
+    return {
+      canEdit,
+      school: {
+        id: school.id,
+        name: school.name,
+        institutionType: school.institutionType,
+        isTertiary: this.isTertiaryInstitution(school.institutionType),
+      },
+      sessions: sessions.map((s) => ({
+        id: s.id,
+        name: s.name,
+        isCurrent: s.isCurrent,
+        terms: s.terms.map((t) => ({
+          id: t.id,
+          name: t.name,
+          isCurrent: t.isCurrent,
+          createdDate: toUtcDateKey(t.createdAt),
+          startDate: t.startDate ? toUtcDateKey(t.startDate) : null,
+          endDate: t.endDate ? toUtcDateKey(t.endDate) : null,
+          nextTermResumesDate: t.nextTermResumesDate
+            ? toUtcDateKey(t.nextTermResumesDate)
+            : null,
+        })),
+      })),
+      selectedTerm: {
+        id: selectedTerm.id,
+        name: selectedTerm.name,
+        sessionId: selectedTerm.sessionId,
+        sessionName: selectedTerm.sessionName,
+        isCurrent: selectedTerm.isCurrent,
+        createdDate: toUtcDateKey(selectedTerm.createdAt),
+        startDate: selectedTerm.startDate
+          ? toUtcDateKey(selectedTerm.startDate)
+          : null,
+        endDate: selectedTerm.endDate
+          ? toUtcDateKey(selectedTerm.endDate)
+          : null,
+        nextTermResumesDate: selectedTerm.nextTermResumesDate
+          ? toUtcDateKey(selectedTerm.nextTermResumesDate)
+          : null,
+      },
+      metrics,
+      events,
+    };
+  }
+
+  async updateTermCalendarDates(
+    userId: string,
+    schoolId: string,
+    termId: string,
+    dto: {
+      startDate?: string | null;
+      endDate?: string | null;
+      nextTermResumesDate?: string | null;
+    },
+  ) {
+    await this.verifySchoolAdminAccess(userId, schoolId);
+
+    const term = await this.prisma.academicTerm.findFirst({
+      where: { id: termId, session: { schoolId } },
+    });
+    if (!term) {
+      throw new NotFoundException('Academic term not found for this institution.');
+    }
+
+    const nextStart =
+      dto.startDate === undefined
+        ? undefined
+        : dto.startDate
+        ? this.parseFlexibleDateInput(dto.startDate)
+        : null;
+    const nextEnd =
+      dto.endDate === undefined
+        ? undefined
+        : dto.endDate
+        ? this.parseFlexibleDateInput(dto.endDate)
+        : null;
+    const nextResumes =
+      dto.nextTermResumesDate === undefined
+        ? undefined
+        : dto.nextTermResumesDate
+        ? this.parseFlexibleDateInput(dto.nextTermResumesDate)
+        : null;
+
+    if (dto.startDate && !nextStart) {
+      throw new BadRequestException('Invalid term start date.');
+    }
+    if (dto.endDate && !nextEnd) {
+      throw new BadRequestException('Invalid school vacates date.');
+    }
+    if (dto.nextTermResumesDate && !nextResumes) {
+      throw new BadRequestException('Invalid next term resumes date.');
+    }
+
+    const effectiveStart =
+      nextStart === undefined
+        ? term.startDate ?? term.createdAt
+        : nextStart ?? term.createdAt;
+    const effectiveEnd = nextEnd === undefined ? term.endDate : nextEnd;
+    if (effectiveEnd && toUtcDateKey(effectiveEnd) < toUtcDateKey(effectiveStart)) {
+      throw new BadRequestException(
+        'School vacates date cannot be earlier than the term start date.',
+      );
+    }
+
+    await this.prisma.academicTerm.update({
+      where: { id: term.id },
+      data: {
+        ...(nextStart !== undefined ? { startDate: nextStart } : {}),
+        ...(nextEnd !== undefined ? { endDate: nextEnd } : {}),
+        ...(nextResumes !== undefined
+          ? { nextTermResumesDate: nextResumes }
+          : {}),
+      },
+    });
+
+    return this.getSchoolAcademicCalendar(userId, schoolId, term.id);
+  }
+
+  async createCalendarEvent(
+    userId: string,
+    schoolId: string,
+    termId: string,
+    dto: {
+      title: string;
+      type?: CalendarBreakKind;
+      startDate: string;
+      endDate?: string;
+      description?: string;
+    },
+  ) {
+    await this.verifySchoolAdminAccess(userId, schoolId);
+
+    const term = await this.prisma.academicTerm.findFirst({
+      where: { id: termId, session: { schoolId } },
+    });
+    if (!term) {
+      throw new NotFoundException('Academic term not found for this institution.');
+    }
+
+    const cleanTitle = String(dto.title || '').trim();
+    if (!cleanTitle) {
+      throw new BadRequestException('Holiday or break title is required.');
+    }
+
+    const start = this.parseFlexibleDateInput(dto.startDate);
+    const end = this.parseFlexibleDateInput(dto.endDate || dto.startDate);
+    if (!start || !end) {
+      throw new BadRequestException('Valid start and end dates are required.');
+    }
+    if (toUtcDateKey(end) < toUtcDateKey(start)) {
+      throw new BadRequestException('End date cannot be before start date.');
+    }
+
+    const allowedTypes: CalendarBreakKind[] = ['HOLIDAY', 'MID_TERM', 'OTHER'];
+    const breakType: CalendarBreakKind = allowedTypes.includes(
+      dto.type as CalendarBreakKind,
+    )
+      ? (dto.type as CalendarBreakKind)
+      : 'HOLIDAY';
+
+    await this.prisma.schoolCalendarEvent.create({
+      data: {
+        schoolId,
+        termId: term.id,
+        title: cleanTitle,
+        type: breakType,
+        startDate: start,
+        endDate: end,
+        description: dto.description ? String(dto.description).trim() : null,
+      },
+    });
+
+    return this.getSchoolAcademicCalendar(userId, schoolId, term.id);
+  }
+
+  async updateCalendarEvent(
+    userId: string,
+    schoolId: string,
+    eventId: string,
+    dto: {
+      title?: string;
+      type?: CalendarBreakKind;
+      startDate?: string;
+      endDate?: string;
+      description?: string | null;
+    },
+  ) {
+    await this.verifySchoolAdminAccess(userId, schoolId);
+
+    const existing = await this.prisma.schoolCalendarEvent.findFirst({
+      where: { id: eventId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Calendar event not found.');
+    }
+
+    const nextTitle =
+      dto.title !== undefined ? String(dto.title || '').trim() : existing.title;
+    if (!nextTitle) {
+      throw new BadRequestException('Holiday or break title is required.');
+    }
+
+    const nextStart =
+      dto.startDate !== undefined
+        ? this.parseFlexibleDateInput(dto.startDate)
+        : existing.startDate;
+    const nextEnd =
+      dto.endDate !== undefined
+        ? this.parseFlexibleDateInput(dto.endDate)
+        : existing.endDate;
+    if (!nextStart || !nextEnd) {
+      throw new BadRequestException('Valid start and end dates are required.');
+    }
+    if (toUtcDateKey(nextEnd) < toUtcDateKey(nextStart)) {
+      throw new BadRequestException('End date cannot be before start date.');
+    }
+
+    const allowedTypes: CalendarBreakKind[] = ['HOLIDAY', 'MID_TERM', 'OTHER'];
+    const nextType: CalendarBreakKind =
+      dto.type && allowedTypes.includes(dto.type)
+        ? dto.type
+        : (existing.type as CalendarBreakKind);
+
+    await this.prisma.schoolCalendarEvent.update({
+      where: { id: existing.id },
+      data: {
+        title: nextTitle,
+        type: nextType,
+        startDate: nextStart,
+        endDate: nextEnd,
+        description:
+          dto.description === undefined
+            ? existing.description
+            : dto.description
+            ? String(dto.description).trim()
+            : null,
+      },
+    });
+
+    return this.getSchoolAcademicCalendar(userId, schoolId, existing.termId);
+  }
+
+  async deleteCalendarEvent(
+    userId: string,
+    schoolId: string,
+    eventId: string,
+  ) {
+    await this.verifySchoolAdminAccess(userId, schoolId);
+
+    const existing = await this.prisma.schoolCalendarEvent.findFirst({
+      where: { id: eventId, schoolId },
+    });
+    if (!existing) {
+      throw new NotFoundException('Calendar event not found.');
+    }
+
+    await this.prisma.schoolCalendarEvent.delete({
+      where: { id: existing.id },
+    });
+
+    return this.getSchoolAcademicCalendar(userId, schoolId, existing.termId);
   }
 }
