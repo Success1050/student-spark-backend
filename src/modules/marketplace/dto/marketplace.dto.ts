@@ -21,6 +21,16 @@ export class CreateMarketplaceItemDto {
   subjectId?: string;
   fileSize?: number;
   format?: string;
+  materialType?: string;
+  fileBase64?: string;
+  fileName?: string;
+  royaltySplitJson?: Array<{
+    name: string;
+    userId?: string;
+    percent: number;
+    role?: string;
+  }>;
+  paystackSubaccountCode?: string;
 }
 
 export class QueryMarketplaceDto {
@@ -35,6 +45,7 @@ export class QueryMarketplaceDto {
   search?: string;
   isFree?: boolean | string;
   userId?: string;
+  materialType?: string;
 }
 
 export class InitPurchaseDto {

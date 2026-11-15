@@ -11,6 +11,8 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
+import { ReferralsWalletService } from '../referrals-wallet/referrals-wallet.service.js';
+import { StorageService } from '../storage/storage.service.js';
 import { DrmWatermarkService } from './drm/drm-watermark.service.js';
 import {
   CreateMarketplaceItemDto,
@@ -25,6 +27,8 @@ export class MarketplaceService {
     private readonly prisma: PrismaService,
     private readonly notifications: NotificationsService,
     private readonly drm: DrmWatermarkService,
+    private readonly storage: StorageService,
+    private readonly walletService: ReferralsWalletService,
   ) {}
 
   /**
@@ -302,6 +306,10 @@ export class MarketplaceService {
       }
     }
 
+    if (query.materialType && query.materialType !== 'ALL') {
+      where.materialType = query.materialType;
+    }
+
     // 7. Search query across title, description, courseCode, authorName, faculty, department & school name
     if (query.search && query.search.trim()) {
       const s = query.search.trim();
@@ -449,11 +457,49 @@ export class MarketplaceService {
     const priceKobo = Number(dto.priceKobo) || 0;
     const isFree = dto.isFree === true || priceKobo <= 0;
 
-    const fileUrl =
-      dto.encryptedFileUrl ||
-      `https://cdn.studentspark.app/uploads/${encodeURIComponent(
+    let fileUrl = dto.encryptedFileUrl;
+    let resolvedFileSize = dto.fileSize || 1024 * 1024 * 2;
+    if (dto.fileBase64) {
+      const cleanB64 = dto.fileBase64.replace(/^data:[^;]+;base64,/, '');
+      const buf = Buffer.from(cleanB64, 'base64');
+      if (buf.length > 0) {
+        resolvedFileSize = buf.length;
+        const uploaded = await this.storage.uploadPdfBuffer(
+          buf,
+          dto.fileName || `${dto.title.replace(/\s+/g, '_').toLowerCase()}.pdf`,
+          'marketplace',
+        );
+        fileUrl = uploaded.publicUrl;
+      }
+    }
+
+    if (!fileUrl) {
+      fileUrl = `https://cdn.studentspark.app/uploads/${encodeURIComponent(
         dto.title.replace(/\s+/g, '_').toLowerCase(),
       )}.pdf`;
+    }
+
+    // If seller has existing items with a Paystack subaccount code configured, inherit it
+    let subaccountCode = dto.paystackSubaccountCode?.trim() || null;
+    if (!subaccountCode) {
+      const existingSubaccountItem = await this.prisma.marketplaceItem.findFirst({
+        where: { sellerId, paystackSubaccountCode: { not: null } },
+        select: { paystackSubaccountCode: true },
+        orderBy: { updatedAt: 'desc' },
+      });
+      subaccountCode = existingSubaccountItem?.paystackSubaccountCode || null;
+    }
+
+    const normalizedSplits = Array.isArray(dto.royaltySplitJson)
+      ? dto.royaltySplitJson
+          .filter((r) => r && Number(r.percent) > 0 && r.name)
+          .map((r) => ({
+            name: String(r.name).trim(),
+            userId: r.userId || undefined,
+            percent: Number(r.percent),
+            role: r.role || 'Co-Author',
+          }))
+      : null;
 
     const item = await this.prisma.marketplaceItem.create({
       data: {
@@ -466,6 +512,7 @@ export class MarketplaceService {
         institutionType: dto.institutionType || InstitutionType.UNIVERSITY,
         visibilityScope:
           dto.visibilityScope || MarketplaceVisibilityScope.PUBLIC_MARKETPLACE,
+        materialType: dto.materialType?.trim().toUpperCase() || 'BOOK',
         priceKobo: isFree ? 0 : priceKobo,
         isFree,
         coverUrl: dto.coverUrl,
@@ -477,8 +524,10 @@ export class MarketplaceService {
         termOrSemester: dto.termOrSemester?.trim(),
         classId: dto.classId || seller.classId,
         subjectId: dto.subjectId,
-        fileSize: dto.fileSize || 1024 * 1024 * 2, // 2MB default
+        fileSize: resolvedFileSize,
         format: dto.format || 'PDF',
+        royaltySplitJson: normalizedSplits ?? undefined,
+        paystackSubaccountCode: subaccountCode,
         status: MarketplaceItemStatus.APPROVED, // Auto-approved for frictionless author upload
       },
     });
@@ -589,6 +638,7 @@ export class MarketplaceService {
       priceKobo: item.priceKobo,
       amountNaira,
       paystackReference,
+      paystackSubaccountCode: item.paystackSubaccountCode || null,
       paystackPublicKey: process.env.PAYSTACK_PUBLIC_KEY || 'pk_test_sample_key',
     };
   }
@@ -667,39 +717,82 @@ export class MarketplaceService {
         data: { salesCount: { increment: 1 } },
       });
 
-      // 3. Credit seller wallet (if sellerEarningsKobo > 0)
+      // 3. Credit seller / co-author wallets according to royaltySplitJson (or 100% of net earnings to seller)
       if (sellerEarningsKobo > 0 && item.sellerId) {
-        let sellerWallet = await tx.wallet.findUnique({
-          where: { userId: item.sellerId },
-        });
-        if (!sellerWallet) {
-          sellerWallet = await tx.wallet.create({
-            data: { userId: item.sellerId },
+        const rawSplits = Array.isArray(item.royaltySplitJson)
+          ? (item.royaltySplitJson as Array<{ name?: string; userId?: string; percent?: number }>)
+          : [];
+        const coAuthorRecipients = rawSplits.filter(
+          (r) => r.userId && r.userId !== item.sellerId && Number(r.percent) > 0,
+        );
+
+        let distributedKobo = 0;
+        for (const co of coAuthorRecipients) {
+          const sharePercent = Math.min(95, Math.max(0, Number(co.percent) || 0));
+          const coAmount = Math.floor((sellerEarningsKobo * sharePercent) / 100);
+          if (coAmount <= 0 || !co.userId) continue;
+
+          let coWallet = await tx.wallet.findUnique({ where: { userId: co.userId } });
+          if (!coWallet) {
+            coWallet = await tx.wallet.create({ data: { userId: co.userId } });
+          }
+          await tx.wallet.update({
+            where: { id: coWallet.id },
+            data: { availableBalanceKobo: { increment: coAmount } },
           });
+          await tx.walletTransaction.create({
+            data: {
+              walletId: coWallet.id,
+              type: 'CREDIT',
+              category: 'MARKETPLACE_SALE',
+              amountKobo: coAmount,
+              reference: `SPLIT-${paystackReference}-${co.userId.slice(0, 6)}`,
+              description: `Co-Author Royalty (${sharePercent}%): "${item.title}"`,
+              metadata: {
+                itemId: item.id,
+                buyerId,
+                sharePercent,
+              },
+            },
+          });
+          distributedKobo += coAmount;
         }
 
-        await tx.wallet.update({
-          where: { id: sellerWallet.id },
-          data: { availableBalanceKobo: { increment: sellerEarningsKobo } },
-        });
+        const primaryAmount = Math.max(0, sellerEarningsKobo - distributedKobo);
+        if (primaryAmount > 0) {
+          let sellerWallet = await tx.wallet.findUnique({
+            where: { userId: item.sellerId },
+          });
+          if (!sellerWallet) {
+            sellerWallet = await tx.wallet.create({
+              data: { userId: item.sellerId },
+            });
+          }
 
-        await tx.walletTransaction.create({
-          data: {
-            walletId: sellerWallet.id,
-            type: 'CREDIT',
-            category: 'MARKETPLACE_SALE',
-            amountKobo: sellerEarningsKobo,
-            reference: `SALE-${paystackReference}`,
-            description: `Book Royalty: "${item.title}" (${100 - commissionPercent}% net earnings)`,
-            metadata: {
-              itemId: item.id,
-              buyerId,
-              buyerName: buyer.fullName || buyer.username,
-              grossKobo: amountPaidKobo,
-              commissionPercent,
+          await tx.wallet.update({
+            where: { id: sellerWallet.id },
+            data: { availableBalanceKobo: { increment: primaryAmount } },
+          });
+
+          await tx.walletTransaction.create({
+            data: {
+              walletId: sellerWallet.id,
+              type: 'CREDIT',
+              category: 'MARKETPLACE_SALE',
+              amountKobo: primaryAmount,
+              reference: `SALE-${paystackReference}`,
+              description: `${item.materialType === 'PRACTICAL_MANUAL' ? 'Manual' : item.materialType === 'LECTURE_HANDOUT' ? 'Handout' : 'Book'} Royalty: "${item.title}" (${100 - commissionPercent}% net earnings)`,
+              metadata: {
+                itemId: item.id,
+                buyerId,
+                buyerName: buyer.fullName || buyer.username,
+                grossKobo: amountPaidKobo,
+                commissionPercent,
+                coAuthorDistributedKobo: distributedKobo,
+              },
             },
-          },
-        });
+          });
+        }
       }
 
       return purchase;
@@ -840,5 +933,182 @@ export class MarketplaceService {
       },
     });
     return item;
+  }
+
+  /**
+   * Configures a lecturer's Nigerian NUBAN payout bank account and registers/updates a
+   * Paystack Subaccount split across their published handouts & practical manuals.
+   */
+  async configureLecturerRoyaltyNuban(
+    userId: string,
+    dto: {
+      bankCode: string;
+      bankName: string;
+      accountNumber: string;
+      businessName?: string;
+      percentageCharge?: number;
+    },
+  ) {
+    if (!userId) {
+      throw new BadRequestException('Authenticated lecturer user ID is required');
+    }
+    const cleanAccount = dto.accountNumber?.replace(/\D/g, '') || '';
+    if (cleanAccount.length !== 10 || !dto.bankCode?.trim() || !dto.bankName?.trim()) {
+      throw new BadRequestException('Valid 10-digit NUBAN account number, bank code, and bank name are required');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+
+    let accountName = user.fullName || user.username || 'Lecturer Author';
+    try {
+      const resolved = await this.walletService.resolveBankAccount({
+        accountNumber: cleanAccount,
+        bankCode: dto.bankCode.trim(),
+      });
+      if (resolved?.accountName) {
+        accountName = resolved.accountName;
+      }
+    } catch {
+      // Fallback to profile name when live Paystack test keys cannot resolve real bank accounts
+    }
+
+    const businessName =
+      dto.businessName?.trim() || `${accountName} Academic Press`;
+    const percentageCharge = Math.min(30, Math.max(5, Number(dto.percentageCharge) || 20));
+
+    let subaccountCode = `ACCT_SSP_${cleanAccount.slice(-4)}_${dto.bankCode.trim()}`;
+    const paystackSecret = process.env.PAYSTACK_SECRET_KEY;
+    if (paystackSecret && !paystackSecret.includes('placeholder') && !paystackSecret.includes('sample')) {
+      try {
+        const res = await fetch('https://api.paystack.co/subaccount', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${paystackSecret}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            business_name: businessName,
+            settlement_bank: dto.bankCode.trim(),
+            account_number: cleanAccount,
+            percentage_charge: percentageCharge,
+            description: `StudentSpark Lecturer Royalty Split for ${accountName}`,
+          }),
+        });
+        const data: any = await res.json().catch(() => null);
+        if (res.ok && data?.data?.subaccount_code) {
+          subaccountCode = data.data.subaccount_code;
+        }
+      } catch (err) {
+        this.logger.warn(`Paystack subaccount sync skipped: ${String(err)}`);
+      }
+    }
+
+    const wallet = await this.prisma.wallet.upsert({
+      where: { userId },
+      create: {
+        userId,
+        bankCode: dto.bankCode.trim(),
+        bankName: dto.bankName.trim(),
+        accountNumber: cleanAccount,
+        accountName,
+      },
+      update: {
+        bankCode: dto.bankCode.trim(),
+        bankName: dto.bankName.trim(),
+        accountNumber: cleanAccount,
+        accountName,
+      },
+    });
+
+    await this.prisma.marketplaceItem.updateMany({
+      where: { sellerId: userId },
+      data: { paystackSubaccountCode: subaccountCode },
+    });
+
+    return {
+      success: true,
+      message: 'NUBAN payout account & Paystack royalty split configured.',
+      accountName,
+      bankName: wallet.bankName,
+      bankCode: wallet.bankCode,
+      accountNumber: wallet.accountNumber,
+      paystackSubaccountCode: subaccountCode,
+      lecturerSharePercent: 100 - percentageCharge,
+      platformCommissionPercent: percentageCharge,
+    };
+  }
+
+  /**
+   * Returns lecturer handouts/manuals catalog, NUBAN payout details, and royalty ledger.
+   */
+  async getLecturerRoyaltiesSummary(userId: string) {
+    if (!userId) {
+      throw new BadRequestException('Authenticated lecturer user ID is required');
+    }
+
+    const [wallet, items] = await Promise.all([
+      this.prisma.wallet.findUnique({
+        where: { userId },
+        include: {
+          transactions: {
+            where: { category: 'MARKETPLACE_SALE' },
+            orderBy: { createdAt: 'desc' },
+            take: 25,
+          },
+        },
+      }),
+      this.prisma.marketplaceItem.findMany({
+        where: { sellerId: userId },
+        include: {
+          purchases: {
+            orderBy: { purchasedAt: 'desc' },
+            take: 10,
+            select: {
+              id: true,
+              amountPaidKobo: true,
+              sellerEarningsKobo: true,
+              platformCommissionKobo: true,
+              purchasedAt: true,
+              buyer: { select: { fullName: true, studentCode: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+    ]);
+
+    const totalRoyaltiesKobo = items.reduce(
+      (sum, it) =>
+        sum +
+        it.purchases.reduce((pSum, p) => pSum + (p.sellerEarningsKobo || 0), 0),
+      0,
+    );
+    const totalSalesCount = items.reduce((sum, it) => sum + (it.salesCount || 0), 0);
+    const activeSubaccount =
+      items.find((it) => it.paystackSubaccountCode)?.paystackSubaccountCode || null;
+
+    return {
+      success: true,
+      payoutAccount: wallet
+        ? {
+            bankName: wallet.bankName,
+            bankCode: wallet.bankCode,
+            accountNumber: wallet.accountNumber,
+            accountName: wallet.accountName,
+            availableBalanceKobo: wallet.availableBalanceKobo,
+            availableBalanceNaira: Math.round(wallet.availableBalanceKobo / 100),
+            paystackSubaccountCode: activeSubaccount,
+          }
+        : null,
+      stats: {
+        publishedCount: items.length,
+        totalSalesCount,
+        totalRoyaltiesKobo,
+        totalRoyaltiesNaira: Math.round(totalRoyaltiesKobo / 100),
+      },
+      items,
+      recentRoyalties: wallet?.transactions || [],
+    };
   }
 }

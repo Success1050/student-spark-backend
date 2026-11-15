@@ -14,12 +14,26 @@ export class UsersService {
       include: {
         school: true,
         schoolClass: true,
+        studentProfile: true,
+        courseRepAssignments: {
+          where: { isActive: true },
+          include: {
+            schoolClass: { select: { id: true, name: true } },
+            subject: { select: { id: true, name: true, courseCode: true } },
+            department: { select: { id: true, name: true, code: true } },
+          },
+        },
       },
     });
 
     if (!user) {
       throw new NotFoundException('User profile not found');
     }
+
+    const isCourseRep = Boolean(
+      user.studentProfile?.isCourseRep ||
+        (user.courseRepAssignments && user.courseRepAssignments.length > 0),
+    );
 
     return {
       ...user,
@@ -35,6 +49,12 @@ export class UsersService {
       class_id: user.classId,
       subscription_start: user.subscriptionStart,
       subscription_end: user.subscriptionEnd,
+      isCourseRep,
+      is_course_rep: isCourseRep,
+      institutionType: user.school?.institutionType || null,
+      academicContinuityMode: user.school?.academicContinuityMode || 'ACTIVE',
+      strikeNoticeTitle: user.school?.strikeNoticeTitle || null,
+      strikeNoticeBody: user.school?.strikeNoticeBody || null,
     };
   }
 

@@ -413,6 +413,9 @@ export class AuthService {
       schoolName: activeSchool?.name || null,
       schoolCode: activeSchool?.schoolCode || null,
       institutionType: activeSchool?.institutionType || null,
+      academicContinuityMode: activeSchool?.academicContinuityMode || 'ACTIVE',
+      strikeNoticeTitle: activeSchool?.strikeNoticeTitle || null,
+      strikeNoticeBody: activeSchool?.strikeNoticeBody || null,
       loginId: targetMembership?.loginId || targetUser.loginId || null,
       mustChangePassword,
     };

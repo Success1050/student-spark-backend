@@ -208,7 +208,12 @@ export class AttendanceService {
       throw new NotFoundException('Course / Subject not found.');
     }
 
-    const isFormTeacher = subject.schoolClass.formTeacherId === userId;
+    const subjectIsTertiary = this.isTertiaryInstitution(
+      subject.school?.institutionType,
+    );
+    const isFormTeacher = subjectIsTertiary
+      ? false
+      : subject.schoolClass.formTeacherId === userId;
     if (userId) {
       const user = await this.prisma.user.findUnique({
         where: { id: userId },
@@ -220,15 +225,16 @@ export class AttendanceService {
         const isAssignedProfile = subject.assignedTeachers.some(
           (t) => t.userId === userId,
         );
-        const handlesClassAllSubjects =
-          await this.prisma.teacherProfile.findFirst({
-            where: {
-              userId,
-              handlesAllSubjects: true,
-              assignedClasses: { some: { id: subject.classId } },
-            },
-            select: { id: true },
-          });
+        const handlesClassAllSubjects = subjectIsTertiary
+          ? null
+          : await this.prisma.teacherProfile.findFirst({
+              where: {
+                userId,
+                handlesAllSubjects: true,
+                assignedClasses: { some: { id: subject.classId } },
+              },
+              select: { id: true },
+            });
 
         if (
           !isDirectTeacher &&
@@ -331,7 +337,13 @@ export class AttendanceService {
           );
         }
 
-        canEdit = isTertiary ? true : isFormTeacher;
+        if (isTertiary) {
+          throw new ForbiddenException(
+            'Attendance in tertiary institutions must be taken per assigned course, not per class.',
+          );
+        }
+
+        canEdit = isFormTeacher;
         if (requireWrite && !canEdit) {
           throw new ForbiddenException(
             'Read-only access: Only the assigned Form Teacher for this class (or a School Admin) can mark or edit daily class attendance.',

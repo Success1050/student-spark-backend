@@ -393,9 +393,10 @@ export class TeacherService {
         minAttendancePercent: c.minAttendancePercent ?? 75,
         departmentId: c.departmentId,
         departmentName: c.department?.name || 'General',
-        isFormTeacher,
-        handlesAllSubjects: isFullClassTeacher,
-        canMarkAttendance: isTertiary ? true : isFormTeacher,
+        isFormTeacher: isTertiary ? false : isFormTeacher,
+        handlesAllSubjects: isTertiary ? false : isFullClassTeacher,
+        // Tertiary lecturers take attendance per assigned course, not per class
+        canMarkAttendance: isTertiary ? false : isFormTeacher,
         studentCount: c._count.studentProfiles,
         totalClassSubjectsCount: c.subjects.length,
         assignedSubjects: effectiveSubjects,

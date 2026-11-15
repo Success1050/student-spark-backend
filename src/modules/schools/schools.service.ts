@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import AdmZip from 'adm-zip';
 import * as bcrypt from 'bcryptjs';
+import { SignJWT } from 'jose';
 import { randomBytes, randomUUID } from 'crypto';
 import { PrismaService } from '../../database/prisma.service.js';
 
@@ -1156,7 +1157,7 @@ export class SchoolsService {
           teacherProfileId: info.teacherProfileId ?? null,
           userId,
           fullName: info.fullName || 'Instructor',
-          title: info.title || 'Teacher',
+          title: info.title || (isTertiary ? 'Lecturer' : 'Teacher'),
           staffId: info.staffId || 'STAFF',
           email: info.email || '',
           roles: new Set<string>(),
@@ -1168,7 +1169,7 @@ export class SchoolsService {
       if (subjectName) entry.subjects.add(subjectName);
     };
 
-    if (formTeacherUser) {
+    if (formTeacherUser && !isTertiary) {
       upsertTeacher(
         formTeacherUser.userId,
         {
@@ -1192,10 +1193,15 @@ export class SchoolsService {
           staffId: tp.staffId,
           email: tp.user?.email,
         },
-        'Class Teacher',
+        isTertiary ? 'Course Lecturer' : 'Class Teacher',
       );
       for (const s of tp.assignedSubjects) {
-        upsertTeacher(tp.userId, { teacherProfileId: tp.id }, 'Subject Teacher', s.name);
+        upsertTeacher(
+          tp.userId,
+          { teacherProfileId: tp.id },
+          isTertiary ? 'Course Lecturer' : 'Subject Teacher',
+          s.name,
+        );
       }
     }
 
@@ -1207,7 +1213,7 @@ export class SchoolsService {
             fullName: subj.teacher.fullName,
             email: subj.teacher.email,
           },
-          'Subject Teacher',
+          isTertiary ? 'Course Lecturer' : 'Subject Teacher',
           subj.name,
         );
       }
@@ -1221,7 +1227,7 @@ export class SchoolsService {
             staffId: tp.staffId,
             email: tp.user?.email,
           },
-          'Subject Teacher',
+          isTertiary ? 'Course Lecturer' : 'Subject Teacher',
           subj.name,
         );
       }
@@ -1475,7 +1481,14 @@ export class SchoolsService {
         classHistory: {
           include: {
             schoolClass: {
-              select: { id: true, name: true, levelCode: true },
+              select: {
+                id: true,
+                name: true,
+                levelCode: true,
+                department: {
+                  select: { id: true, name: true, code: true },
+                },
+              },
             },
           },
           orderBy: { assignedAt: 'desc' },
@@ -1867,10 +1880,34 @@ export class SchoolsService {
       if (!Number.isNaN(d.getTime())) parsedDateHired = d;
     }
 
+    const instUpper = String(school.institutionType || '').toUpperCase();
+    const isTertiary =
+      instUpper === 'UNIVERSITY' ||
+      instUpper === 'POLYTECHNIC' ||
+      instUpper === 'COLLEGE_OF_EDUCATION' ||
+      instUpper === 'TECHNICAL';
+    const defaultEducatorTitle = isTertiary ? 'Lecturer' : 'Teacher';
+
+    const subjectDerivedClassIds =
+      dto.assignedSubjectIds?.length
+        ? (
+            await this.prisma.schoolSubject.findMany({
+              where: { schoolId, id: { in: dto.assignedSubjectIds } },
+              select: { classId: true },
+            })
+          ).map((s) => s.classId)
+        : [];
+
+    const effectiveFormClassIds = isTertiary ? [] : dto.formClassIds || [];
+    const effectiveHandlesAll = isTertiary ? false : Boolean(dto.handlesAllSubjects);
+
     const cleanClassIds = Array.from(
       new Set([
         ...(dto.assignedClassIds || []),
-        ...(dto.handlesAllSubjects && dto.formClassIds?.length ? dto.formClassIds : []),
+        ...subjectDerivedClassIds,
+        ...(effectiveHandlesAll && effectiveFormClassIds.length
+          ? effectiveFormClassIds
+          : []),
       ]),
     );
 
@@ -1879,7 +1916,7 @@ export class SchoolsService {
         userId: user.id,
         schoolId,
         staffId: cleanStaffId,
-        title: dto.title?.trim() || 'Lecturer',
+        title: dto.title?.trim() || defaultEducatorTitle,
         departmentId: dto.departmentId || null,
         specialization: dto.specialization?.trim() || null,
         educationLevel: dto.educationLevel?.trim() || null,
@@ -1890,7 +1927,7 @@ export class SchoolsService {
         employmentType: dto.employmentType?.trim() || null,
         yearsOfExperience: parsedYears,
         dateHired: parsedDateHired,
-        handlesAllSubjects: Boolean(dto.handlesAllSubjects),
+        handlesAllSubjects: effectiveHandlesAll,
         assignedClasses: cleanClassIds.length
           ? { connect: cleanClassIds.map((id) => ({ id })) }
           : undefined,
@@ -1923,8 +1960,8 @@ export class SchoolsService {
       },
     });
 
-    const formClasses = dto.formClassIds?.length
-      ? await this.syncFormTeacherClasses(schoolId, user.id, dto.formClassIds)
+    const formClasses = effectiveFormClassIds.length
+      ? await this.syncFormTeacherClasses(schoolId, user.id, effectiveFormClassIds)
       : [];
 
     await this.syncTeacherClassHistory(
@@ -1932,8 +1969,9 @@ export class SchoolsService {
       teacherProfile.id,
       cleanClassIds,
       dto.assignedSubjectIds || [],
-      dto.formClassIds || [],
-      Boolean(dto.handlesAllSubjects),
+      effectiveFormClassIds,
+      effectiveHandlesAll,
+      isTertiary,
     );
 
     return {
@@ -1944,7 +1982,7 @@ export class SchoolsService {
       },
       credentialSlip: {
         fullName: dto.fullName.trim(),
-        title: dto.title || 'Lecturer',
+        title: dto.title?.trim() || defaultEducatorTitle,
         staffId: cleanStaffId,
         loginId: cleanStaffId,
         email: staffEmail,
@@ -1991,6 +2029,7 @@ export class SchoolsService {
     assignedSubjectIds: string[],
     formClassIds: string[] = [],
     handlesAllSubjects = false,
+    isTertiary = false,
   ) {
     const subjects = assignedSubjectIds.length
       ? await this.prisma.schoolSubject.findMany({
@@ -2009,6 +2048,7 @@ export class SchoolsService {
     }
 
     const resolveRoleLabel = (cid: string) => {
+      if (isTertiary) return 'Course Lecturer';
       const isForm = formClassIds.includes(cid);
       const isFullClass = handlesAllSubjects && assignedClassIds.includes(cid);
       if (isForm && isFullClass) return 'Form & Full-Class Teacher';
@@ -2081,43 +2121,69 @@ export class SchoolsService {
     const profile = await this.prisma.teacherProfile.findFirst({
       where: { id: teacherProfileId, schoolId },
       include: {
+        school: { select: { institutionType: true } },
         assignedClasses: { select: { id: true } },
         assignedSubjects: { select: { id: true } },
       },
     });
     if (!profile) throw new NotFoundException('Teacher profile not found.');
 
+    const instUpper = String(profile.school?.institutionType || '').toUpperCase();
+    const isTertiary =
+      instUpper === 'UNIVERSITY' ||
+      instUpper === 'POLYTECHNIC' ||
+      instUpper === 'COLLEGE_OF_EDUCATION' ||
+      instUpper === 'TECHNICAL';
+
     const existingFormClasses = await this.prisma.schoolClass.findMany({
       where: { schoolId, formTeacherId: profile.userId },
       select: { id: true },
     });
 
-    const nextHandlesAll =
-      dto.handlesAllSubjects !== undefined
+    const nextHandlesAll = isTertiary
+      ? false
+      : dto.handlesAllSubjects !== undefined
         ? Boolean(dto.handlesAllSubjects)
         : profile.handlesAllSubjects;
-    const nextFormClassIds =
-      dto.formClassIds !== undefined
+    const nextFormClassIds = isTertiary
+      ? []
+      : dto.formClassIds !== undefined
         ? dto.formClassIds
         : existingFormClasses.map((c) => c.id);
-    const nextClassIds = Array.from(
-      new Set([
-        ...(dto.classIds ?? profile.assignedClasses.map((c) => c.id)),
-        ...(nextHandlesAll && nextFormClassIds.length > 0 && dto.classIds === undefined
-          ? nextFormClassIds
-          : []),
-      ]),
-    );
     const nextSubjectIds =
       dto.subjectIds ?? profile.assignedSubjects.map((s) => s.id);
+
+    const subjectDerivedClassIds =
+      isTertiary && nextSubjectIds.length > 0
+        ? (
+            await this.prisma.schoolSubject.findMany({
+              where: { schoolId, id: { in: nextSubjectIds } },
+              select: { classId: true },
+            })
+          ).map((s) => s.classId)
+        : [];
+
+    const nextClassIds = isTertiary
+      ? Array.from(new Set(subjectDerivedClassIds))
+      : Array.from(
+          new Set([
+            ...(dto.classIds ?? profile.assignedClasses.map((c) => c.id)),
+            ...(nextHandlesAll && nextFormClassIds.length > 0 && dto.classIds === undefined
+              ? nextFormClassIds
+              : []),
+          ]),
+        );
 
     const updated = await this.prisma.teacherProfile.update({
       where: { id: teacherProfileId },
       data: {
-        handlesAllSubjects:
-          dto.handlesAllSubjects !== undefined ? nextHandlesAll : undefined,
+        handlesAllSubjects: isTertiary
+          ? false
+          : dto.handlesAllSubjects !== undefined
+            ? nextHandlesAll
+            : undefined,
         assignedClasses:
-          dto.classIds !== undefined
+          isTertiary || dto.classIds !== undefined
             ? { set: nextClassIds.map((id) => ({ id })) }
             : undefined,
         assignedSubjects: dto.subjectIds
@@ -2132,7 +2198,7 @@ export class SchoolsService {
     });
 
     const formClasses =
-      dto.formClassIds !== undefined
+      isTertiary || dto.formClassIds !== undefined
         ? await this.syncFormTeacherClasses(schoolId, profile.userId, nextFormClassIds)
         : existingFormClasses;
 
@@ -2143,6 +2209,7 @@ export class SchoolsService {
       nextSubjectIds,
       nextFormClassIds,
       nextHandlesAll,
+      isTertiary,
     );
 
     return {
@@ -3084,5 +3151,465 @@ export class SchoolsService {
     });
 
     return { success: true, school: updated };
+  }
+
+  // ============================================================================
+  // DAY 15B: SUG / DEPARTMENTAL ASSOCIATION FAST ONBOARDING & STRIKE CONTINUITY
+  // ============================================================================
+
+  async createSugCampaign(
+    schoolId: string,
+    userId: string,
+    dto: {
+      associationName: string;
+      shortCode?: string;
+      code?: string;
+      departmentId?: string;
+      classId?: string;
+      defaultClassId?: string;
+      defaultLevel?: string;
+      welcomeMessage?: string;
+    },
+  ) {
+    if (!dto.associationName?.trim()) {
+      throw new BadRequestException('Association or SUG name is required.');
+    }
+
+    const school = await this.prisma.school.findUnique({ where: { id: schoolId } });
+    if (!school) throw new NotFoundException('Institution not found.');
+
+    const cleanPrefix = (school.schoolCode || school.name || 'UNI')
+      .replace(/[^A-Z0-9]/gi, '')
+      .toUpperCase()
+      .slice(0, 5);
+    const shortCode = (
+      dto.shortCode?.trim() ||
+      dto.code?.trim() ||
+      `SUG-${cleanPrefix}-${randomBytes(2).toString('hex').toUpperCase()}`
+    ).toUpperCase();
+
+    const campaign = await this.prisma.sugOnboardingCampaign.create({
+      data: {
+        schoolId,
+        shortCode,
+        associationName: dto.associationName.trim(),
+        departmentId: dto.departmentId || null,
+        classId: dto.classId || dto.defaultClassId || null,
+        defaultLevel: dto.defaultLevel?.trim() || '100L',
+        welcomeMessage:
+          dto.welcomeMessage?.trim() ||
+          `Fast onboarding enabled via ${dto.associationName.trim()}. Instant access to 10-Yr Departmental Past Questions & Course Rep updates.`,
+        createdById: userId || null,
+      },
+      include: {
+        department: { select: { id: true, name: true, code: true } },
+        schoolClass: { select: { id: true, name: true, levelCode: true } },
+      },
+    });
+
+    return { success: true, campaign };
+  }
+
+  async listSugCampaigns(schoolId: string) {
+    const [school, campaigns, departments, classes] = await Promise.all([
+      this.prisma.school.findUnique({
+        where: { id: schoolId },
+        select: {
+          id: true,
+          name: true,
+          schoolCode: true,
+          academicContinuityMode: true,
+          strikeNoticeTitle: true,
+          strikeNoticeBody: true,
+          strikePausedAt: true,
+          continuityUpdatedAt: true,
+        },
+      }),
+      this.prisma.sugOnboardingCampaign.findMany({
+        where: { schoolId },
+        include: {
+          department: { select: { id: true, name: true, code: true } },
+          schoolClass: { select: { id: true, name: true, levelCode: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.department.findMany({
+        where: { schoolId },
+        select: { id: true, name: true, code: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.schoolClass.findMany({
+        where: { schoolId },
+        select: { id: true, name: true, levelCode: true, departmentId: true },
+        orderBy: { name: 'asc' },
+      }),
+    ]);
+
+    return {
+      success: true,
+      school,
+      campaigns,
+      departments,
+      classes,
+    };
+  }
+
+  async lookupSugCampaign(code: string) {
+    const cleanCode = code?.trim().toUpperCase();
+    if (!cleanCode) {
+      throw new BadRequestException('Association invite code is required.');
+    }
+
+    const campaign = await this.prisma.sugOnboardingCampaign.findUnique({
+      where: { shortCode: cleanCode },
+      include: {
+        school: {
+          select: {
+            id: true,
+            name: true,
+            schoolCode: true,
+            institutionType: true,
+            primaryColor: true,
+            academicContinuityMode: true,
+            strikeNoticeTitle: true,
+            strikeNoticeBody: true,
+          },
+        },
+        department: { select: { id: true, name: true, code: true } },
+        schoolClass: { select: { id: true, name: true, levelCode: true } },
+      },
+    });
+
+    if (!campaign || !campaign.isActive) {
+      throw new NotFoundException('Invalid or inactive SUG/Association invite code.');
+    }
+
+    const [departments, classes] = await Promise.all([
+      this.prisma.department.findMany({
+        where: { schoolId: campaign.schoolId },
+        select: { id: true, name: true, code: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.schoolClass.findMany({
+        where: { schoolId: campaign.schoolId },
+        select: { id: true, name: true, levelCode: true, departmentId: true },
+        orderBy: { name: 'asc' },
+      }),
+    ]);
+
+    return {
+      success: true,
+      campaign,
+      departments,
+      classes,
+    };
+  }
+
+  async fastOnboardViaSug(dto: {
+    code: string;
+    fullName: string;
+    email: string;
+    matricNo?: string;
+    password: string;
+    departmentId?: string;
+    classId?: string;
+    level?: string;
+  }) {
+    const cleanCode = dto.code?.trim().toUpperCase();
+    const email = dto.email?.trim().toLowerCase();
+    if (!cleanCode || !dto.fullName?.trim() || !email || !dto.password) {
+      throw new BadRequestException(
+        'Invite code, full name, email, and password are required.',
+      );
+    }
+    if (dto.password.length < 6) {
+      throw new BadRequestException('Password must be at least 6 characters.');
+    }
+
+    const campaign = await this.prisma.sugOnboardingCampaign.findUnique({
+      where: { shortCode: cleanCode },
+      include: { school: true },
+    });
+    if (!campaign || !campaign.isActive) {
+      throw new NotFoundException('Invalid or inactive SUG/Association invite code.');
+    }
+
+    const existingEmail = await this.prisma.user.findUnique({ where: { email } });
+    if (existingEmail) {
+      throw new BadRequestException(
+        'An account with this email already exists. Please Sign In instead.',
+      );
+    }
+
+    let matric = dto.matricNo?.trim().toUpperCase();
+    if (matric) {
+      const taken = await this.isMemberIdTakenGlobally(matric);
+      if (taken) {
+        throw new BadRequestException(
+          `Matric / Admission No "${matric}" is already registered.`,
+        );
+      }
+    } else {
+      matric = await this.generateUniqueMemberId(campaign.school, 'STU');
+    }
+
+    const passwordHash = await bcrypt.hash(dto.password, 10);
+    const departmentId = dto.departmentId || campaign.departmentId || null;
+    const classId = dto.classId || campaign.classId || null;
+    const level = dto.level?.trim() || campaign.defaultLevel || '100L';
+
+    const now = new Date();
+    const trialDays = 14;
+    const trialEnd = new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000);
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          email,
+          fullName: dto.fullName.trim(),
+          username: dto.fullName.trim(),
+          passwordHash,
+          role: 'STUDENT',
+          schoolId: campaign.schoolId,
+          classId,
+          loginId: matric,
+          mustChangePassword: false,
+          plan: 'pro',
+          subscriptionStart: now,
+          subscriptionEnd: trialEnd,
+          referralCode: `SUG-${Math.floor(100000 + Math.random() * 900000)}`,
+        },
+      });
+
+      const membership = await tx.membership.create({
+        data: {
+          userId: user.id,
+          schoolId: campaign.schoolId,
+          role: 'STUDENT',
+          loginId: matric,
+          mustChangePassword: false,
+          status: 'ACTIVE',
+          isDefault: true,
+        },
+      });
+
+      const studentProfile = await tx.studentProfile.create({
+        data: {
+          userId: user.id,
+          schoolId: campaign.schoolId,
+          matricOrAdmissionNo: matric,
+          departmentId,
+          classId,
+          level,
+        },
+      });
+
+      if (classId) {
+        await tx.classEnrollment.create({
+          data: {
+            studentId: user.id,
+            classId,
+          },
+        });
+      }
+
+      await tx.sugOnboardingCampaign.update({
+        where: { id: campaign.id },
+        data: { joinedCount: { increment: 1 } },
+      });
+
+      await tx.notification.create({
+        data: {
+          userId: user.id,
+          title: `Welcome via ${campaign.associationName}!`,
+          body:
+            campaign.welcomeMessage ||
+            `Your ${campaign.school.name} student profile (${matric}) is active with ${trialDays} days Pro study access.`,
+          category: 'SYSTEM',
+        },
+      });
+
+      return { user, membership, studentProfile };
+    });
+
+    const jwtSecret = new TextEncoder().encode(
+      process.env.JWT_SECRET ||
+        process.env.JWT_ACCESS_SECRET ||
+        'studentspark-default-secret-key',
+    );
+
+    const accessToken = await new SignJWT({
+      sub: result.user.id,
+      email: result.user.email,
+      role: 'STUDENT',
+      schoolId: campaign.schoolId,
+      activeTenantId: campaign.schoolId,
+      membershipId: result.membership.id,
+      plan: result.user.plan,
+      mustChangePassword: false,
+    })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuedAt()
+      .setExpirationTime('30d')
+      .sign(jwtSecret);
+
+    const refreshToken = await new SignJWT({
+      sub: result.user.id,
+      type: 'refresh',
+    })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuedAt()
+      .setExpirationTime('90d')
+      .sign(jwtSecret);
+
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 90);
+    await this.prisma.refreshToken.create({
+      data: {
+        userId: result.user.id,
+        tokenHash: refreshToken,
+        expiresAt,
+      },
+    });
+
+    const formattedUser = {
+      id: result.user.id,
+      user_id: result.user.id,
+      email: result.user.email,
+      fullName: result.user.fullName,
+      full_name: result.user.fullName,
+      username: result.user.username,
+      role: 'STUDENT',
+      schoolId: campaign.schoolId,
+      school_id: campaign.schoolId,
+      schoolName: campaign.school.name,
+      schoolCode: campaign.school.schoolCode,
+      institutionType: campaign.school.institutionType,
+      academicContinuityMode: campaign.school.academicContinuityMode || 'ACTIVE',
+      strikeNoticeTitle: campaign.school.strikeNoticeTitle || null,
+      strikeNoticeBody: campaign.school.strikeNoticeBody || null,
+      classId,
+      loginId: matric,
+      plan: result.user.plan,
+      referralCode: result.user.referralCode,
+      referral_code: result.user.referralCode,
+      mustChangePassword: false,
+    };
+
+    return {
+      success: true,
+      message: `Fast onboarding complete! Welcome to ${campaign.school.name} (${matric}).`,
+      user: formattedUser,
+      membership: {
+        id: result.membership.id,
+        role: result.membership.role,
+        status: result.membership.status,
+        schoolId: campaign.schoolId,
+        schoolName: campaign.school.name,
+        institutionType: campaign.school.institutionType,
+      },
+      studentProfile: result.studentProfile,
+      session: {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: formattedUser,
+      },
+    };
+  }
+
+  async getContinuityStatus(schoolId: string) {
+    const school = await this.prisma.school.findUnique({
+      where: { id: schoolId },
+      select: {
+        id: true,
+        name: true,
+        institutionType: true,
+        academicContinuityMode: true,
+        strikeNoticeTitle: true,
+        strikeNoticeBody: true,
+        strikePausedAt: true,
+        continuityUpdatedAt: true,
+      },
+    });
+    if (!school) throw new NotFoundException('Institution not found.');
+
+    const [offlinePqCount, verifiedGlobalPqCount] = await Promise.all([
+      this.prisma.departmentalPastQuestion.count({
+        where: { schoolId },
+      }),
+      this.prisma.departmentalPastQuestion.count({
+        where: { isVerifiedByLecturer: true },
+      }),
+    ]);
+
+    return {
+      success: true,
+      school,
+      offlinePqCount,
+      verifiedGlobalPqCount,
+    };
+  }
+
+  async updateContinuityStatus(
+    schoolId: string,
+    dto: {
+      mode: 'ACTIVE' | 'STRIKE_BREAK';
+      noticeTitle?: string;
+      noticeBody?: string;
+    },
+  ) {
+    const cleanMode = dto.mode === 'STRIKE_BREAK' ? 'STRIKE_BREAK' : 'ACTIVE';
+    const isStrike = cleanMode === 'STRIKE_BREAK';
+
+    const school = await this.prisma.school.update({
+      where: { id: schoolId },
+      data: {
+        academicContinuityMode: cleanMode,
+        strikeNoticeTitle: isStrike
+          ? dto.noticeTitle?.trim() ||
+            'Strike-Proof Continuity Mode Active'
+          : null,
+        strikeNoticeBody: isStrike
+          ? dto.noticeBody?.trim() ||
+            'Semester deadlines are paused while ASUU/union strike resolution is underway. Offline 10-Yr Past Questions, AI Tutor, and Self-Paced Study remain synced.'
+          : null,
+        strikePausedAt: isStrike ? new Date() : null,
+        continuityUpdatedAt: new Date(),
+      },
+      select: {
+        id: true,
+        name: true,
+        academicContinuityMode: true,
+        strikeNoticeTitle: true,
+        strikeNoticeBody: true,
+        strikePausedAt: true,
+        continuityUpdatedAt: true,
+      },
+    });
+
+    // Notify campus members asynchronously
+    const members = await this.prisma.membership.findMany({
+      where: { schoolId, status: 'ACTIVE' },
+      select: { userId: true },
+      take: 300,
+    });
+    if (members.length > 0) {
+      await this.prisma.notification.createMany({
+        data: members.map((m) => ({
+          userId: m.userId,
+          title: isStrike
+            ? school.strikeNoticeTitle || 'Strike-Proof Continuity Activated'
+            : 'Normal Academic Calendar Resumed',
+          body: isStrike
+            ? school.strikeNoticeBody ||
+              'Offline Past Questions & Self-Paced AI Study stay active during the break.'
+            : `${school.name} has switched back to ACTIVE academic mode. Check Course Rep announcements for resumption schedules.`,
+          category: 'SCHOOL_NOTICE',
+          deepLink: isStrike ? '/departmentalPq' : '/courseRep',
+        })),
+      });
+    }
+
+    return { success: true, school };
   }
 }

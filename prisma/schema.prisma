@@ -199,29 +199,46 @@ model School {
   terminologyConfig                  Json?
   masterSecretKey                    String?                 @unique
   secretKeyCreatedAt                 DateTime?
+  academicContinuityMode             String                  @default("ACTIVE")
+  strikeNoticeTitle                  String?
+  strikeNoticeBody                   String?
+  strikePausedAt                     DateTime?
+  continuityUpdatedAt                DateTime?
 
-  academicUnits      AcademicUnit[]
-  departments        Department[]
-  memberships        Membership[]
-  teacherProfiles    TeacherProfile[]
-  studentProfiles    StudentProfile[]
-  auditLogs          AuditLog[]
-  users              User[]
-  academicSessions   AcademicSession[]
-  classes            SchoolClass[]
-  subjects           SchoolSubject[]
-  notes              Note[]
-  quizzes            Quiz[]
-  pastQuestions      PastQuestion[]
-  attendanceSessions AttendanceSession[]
-  assessmentConfigs  AssessmentConfig[]
-  subjectGrades      StudentSubjectGrade[]
-  reportCards        TerminalReportCard[]
-  feeItems           SchoolFeeItem[]
-  marketplaceItems   MarketplaceItem[]
-  communities        StudyCommunity[]
-  notifications      Notification[]
-  calendarEvents     SchoolCalendarEvent[]
+  academicUnits             AcademicUnit[]
+  departments               Department[]
+  memberships               Membership[]
+  teacherProfiles           TeacherProfile[]
+  studentProfiles           StudentProfile[]
+  auditLogs                 AuditLog[]
+  users                     User[]
+  academicSessions          AcademicSession[]
+  classes                   SchoolClass[]
+  subjects                  SchoolSubject[]
+  notes                     Note[]
+  quizzes                   Quiz[]
+  pastQuestions             PastQuestion[]
+  attendanceSessions        AttendanceSession[]
+  assessmentConfigs         AssessmentConfig[]
+  subjectGrades             StudentSubjectGrade[]
+  reportCards               TerminalReportCard[]
+  feeItems                  SchoolFeeItem[]
+  marketplaceItems          MarketplaceItem[]
+  communities               StudyCommunity[]
+  notifications             Notification[]
+  calendarEvents            SchoolCalendarEvent[]
+  courseRepAssignments      CourseRepAssignment[]
+  courseRepBroadcasts       CourseRepBroadcast[]
+  courseRepAttendanceSlips  CourseRepAttendanceSlip[]
+  departmentalPastQuestions DepartmentalPastQuestion[]
+  sugOnboardingCampaigns    SugOnboardingCampaign[]
+  sugRoleConfigs            SugRoleConfig[]
+  sugOfficeHolders          SugOfficeHolder[]
+  sugElections              SugElection[]
+  sugPosts                  SugPost[]
+  sugWelfareTickets         SugWelfareTicket[]
+  sugLeaderMessages         SugLeaderMessage[]
+  sugEndorsementNominees    SugEndorsementNominee[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -298,7 +315,10 @@ model AcademicUnit {
   unitType     String       @default("FACULTY")
   deanOrHeadId String?
   description  String?
-  departments  Department[]
+  departments      Department[]
+  sugRoleConfigs   SugRoleConfig[]
+  sugOfficeHolders SugOfficeHolder[]
+  sugElections     SugElection[]
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 
@@ -316,10 +336,16 @@ model Department {
   name        String
   code        String
   hodId       String?
-  classes     SchoolClass[]
-  subjects    SchoolSubject[]
-  students    StudentProfile[]
-  teachers    TeacherProfile[]
+  classes                   SchoolClass[]
+  subjects                  SchoolSubject[]
+  students                  StudentProfile[]
+  teachers                  TeacherProfile[]
+  courseRepAssignments      CourseRepAssignment[]
+  departmentalPastQuestions DepartmentalPastQuestion[]
+  sugOnboardingCampaigns    SugOnboardingCampaign[]
+  sugRoleConfigs            SugRoleConfig[]
+  sugOfficeHolders          SugOfficeHolder[]
+  sugElections              SugElection[]
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
 
@@ -350,8 +376,13 @@ model SchoolClass {
   attendanceSessions AttendanceSession[]
   subjectGrades      StudentSubjectGrade[]
   reportCards        TerminalReportCard[]
-  marketplaceItems   MarketplaceItem[]
-  teacherHistory     ClassTeacherAssignmentHistory[]
+  marketplaceItems         MarketplaceItem[]
+  teacherHistory           ClassTeacherAssignmentHistory[]
+  courseRepAssignments     CourseRepAssignment[]
+  courseRepBroadcasts      CourseRepBroadcast[]
+  courseRepAttendanceSlips CourseRepAttendanceSlip[]
+  sugOnboardingCampaigns   SugOnboardingCampaign[]
+  sugOfficeHolders         SugOfficeHolder[]
   createdAt          DateTime              @default(now())
   updatedAt          DateTime              @updatedAt
 
@@ -379,8 +410,11 @@ model SchoolSubject {
   quizzes              Quiz[]
   attendanceSessions   AttendanceSession[]
   assessmentConfig     AssessmentConfig?
-  subjectGrades        StudentSubjectGrade[]
-  marketplaceItems     MarketplaceItem[]
+  subjectGrades            StudentSubjectGrade[]
+  marketplaceItems         MarketplaceItem[]
+  courseRepAssignments     CourseRepAssignment[]
+  courseRepBroadcasts      CourseRepBroadcast[]
+  courseRepAttendanceSlips CourseRepAttendanceSlip[]
   createdAt            DateTime              @default(now())
   updatedAt            DateTime              @updatedAt
 
@@ -469,9 +503,25 @@ model User {
   memberships          Membership[]
   teacherProfile       TeacherProfile?
   studentProfile       StudentProfile?
-  cbtSubmissions       CbtSubmission[]
-  auditLogs            AuditLog[]
-  loginOtps            LoginOtp[]
+  cbtSubmissions            CbtSubmission[]
+  auditLogs                 AuditLog[]
+  loginOtps                 LoginOtp[]
+  courseRepAssignments      CourseRepAssignment[]      @relation("CourseRepStudent")
+  delegatedCourseReps       CourseRepAssignment[]      @relation("CourseRepDelegator")
+  courseRepBroadcasts       CourseRepBroadcast[]
+  createdAttendanceSlips    CourseRepAttendanceSlip[]  @relation("SlipCreator")
+  signedAttendanceSlips     CourseRepAttendanceSlipEntry[]
+  uploadedDepartmentalPqs   DepartmentalPastQuestion[] @relation("DeptPqUploader")
+  sugOfficeHolders          SugOfficeHolder[]          @relation("SugHolderUser")
+  sugElectionCandidacies    SugElectionCandidate[]     @relation("SugCandidateUser")
+  sugElectionVotes          SugElectionVote[]          @relation("SugVoterUser")
+  sugPosts                  SugPost[]                  @relation("SugPostAuthor")
+  sugWelfareTickets         SugWelfareTicket[]         @relation("SugWelfareReporter")
+  sugMessagesSent           SugLeaderMessage[]         @relation("SugMsgSender")
+  sugMessagesReceived       SugLeaderMessage[]         @relation("SugMsgRecipient")
+  sugEndorsementsReceived   SugEndorsementNominee[]    @relation("SugNomineeUser")
+  sugNominationsMade        SugEndorsementNominee[]    @relation("SugNominatorUser")
+  sugEndorsementVotes       SugEndorsementVote[]       @relation("SugEndorserUser")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -554,6 +604,7 @@ model StudentProfile {
   guardianPhone        String?
   cgpa                 Float        @default(0.0)
   totalCredits         Int          @default(0)
+  isCourseRep          Boolean      @default(false)
   createdAt            DateTime     @default(now())
   updatedAt            DateTime     @updatedAt
 
@@ -1085,6 +1136,9 @@ model MarketplaceItem {
   subject                         SchoolSubject?        @relation(fields: [subjectId], references: [id], onDelete: SetNull)
   fileSize                        Int?
   format                          String?               @default("PDF")
+  materialType                    String                @default("BOOK")
+  royaltySplitJson                Json?
+  paystackSubaccountCode          String?
   downloadCount                   Int                   @default(0)
   customPlatformCommissionPercent Float?
   salesCount                      Int                   @default(0)
@@ -1241,4 +1295,387 @@ model LoginOtp {
   @@index([tempTicket])
   @@index([userId])
   @@map("login_otps")
+}
+
+// ============================================================================
+// 8. NIGERIAN TERTIARY ADOPTION ENGINE (DAY 15B):
+//    COURSE REP DELEGATION, 10-YEAR DEPT PQ BANK & SUG FAST ONBOARDING
+// ============================================================================
+
+model CourseRepAssignment {
+  id                         String         @id @default(uuid())
+  schoolId                   String
+  school                     School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  classId                    String
+  schoolClass                SchoolClass    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  subjectId                  String?
+  subject                    SchoolSubject? @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  departmentId               String?
+  department                 Department?    @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  studentId                  String
+  student                    User           @relation("CourseRepStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  delegatedById              String?
+  delegatedBy                User?          @relation("CourseRepDelegator", fields: [delegatedById], references: [id], onDelete: SetNull)
+  title                      String         @default("Course Representative")
+  canBroadcastVenue          Boolean        @default(true)
+  canDistributeSlides        Boolean        @default(true)
+  canGenerateAttendanceSlips Boolean        @default(true)
+  isActive                   Boolean        @default(true)
+  expiresAt                  DateTime?
+  createdAt                  DateTime       @default(now())
+  updatedAt                  DateTime       @updatedAt
+
+  @@unique([schoolId, classId, subjectId, studentId])
+  @@index([studentId, isActive])
+  @@index([schoolId, classId])
+  @@map("course_rep_assignments")
+}
+
+model CourseRepBroadcast {
+  id            String         @id @default(uuid())
+  schoolId      String
+  school        School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  classId       String
+  schoolClass   SchoolClass    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  subjectId     String?
+  subject       SchoolSubject? @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  senderId      String
+  sender        User           @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  title         String
+  message       String         @db.Text
+  venue         String?
+  scheduledTime String?
+  urgency       String         @default("NORMAL")
+  createdAt     DateTime       @default(now())
+
+  @@index([schoolId, classId, createdAt])
+  @@map("course_rep_broadcasts")
+}
+
+model CourseRepAttendanceSlip {
+  id              String                         @id @default(uuid())
+  schoolId        String
+  school          School                         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  classId         String
+  schoolClass     SchoolClass                    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  subjectId       String?
+  subject         SchoolSubject?                 @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  createdById     String
+  createdBy       User                           @relation("SlipCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  courseCode      String
+  courseTitle     String
+  venue           String?
+  slipCode        String                         @unique
+  linkedSessionId String?
+  expiresAt       DateTime
+  isActive        Boolean                        @default(true)
+  entries         CourseRepAttendanceSlipEntry[]
+  createdAt       DateTime                       @default(now())
+
+  @@index([schoolId, classId, createdAt])
+  @@map("course_rep_attendance_slips")
+}
+
+model CourseRepAttendanceSlipEntry {
+  id          String                  @id @default(uuid())
+  slipId      String
+  slip        CourseRepAttendanceSlip @relation(fields: [slipId], references: [id], onDelete: Cascade)
+  studentId   String
+  student     User                    @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  matricNo    String?
+  studentName String
+  signedAt    DateTime                @default(now())
+
+  @@unique([slipId, studentId])
+  @@index([slipId])
+  @@map("course_rep_attendance_slip_entries")
+}
+
+model DepartmentalPastQuestion {
+  id                   String          @id @default(uuid())
+  schoolId             String?
+  school               School?         @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+  departmentId         String?
+  department           Department?     @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  institutionType      InstitutionType @default(UNIVERSITY)
+  facultyName          String?
+  departmentName       String
+  levelCode            String          @default("100L")
+  courseCode           String
+  courseTitle          String
+  academicYear         String
+  semester             String          @default("First Semester")
+  examType             String          @default("Semester Exam")
+  questionText         String          @db.Text
+  fileUrl              String?
+  aiSolutionJson       Json?
+  isVerifiedByLecturer Boolean         @default(false)
+  verifiedById         String?
+  uploadedById         String?
+  uploadedBy           User?           @relation("DeptPqUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+  downloadCount        Int             @default(0)
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  @@index([schoolId, departmentName, courseCode, academicYear])
+  @@index([institutionType, courseCode])
+  @@map("departmental_past_questions")
+}
+
+model SugOnboardingCampaign {
+  id              String       @id @default(uuid())
+  schoolId        String
+  school          School       @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  departmentId    String?
+  department      Department?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  classId         String?
+  schoolClass     SchoolClass? @relation(fields: [classId], references: [id], onDelete: SetNull)
+  associationName String
+  shortCode       String       @unique
+  defaultLevel    String       @default("100L")
+  welcomeMessage  String?      @db.Text
+  createdById     String?
+  joinedCount     Int          @default(0)
+  isActive        Boolean      @default(true)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@index([schoolId, isActive])
+  @@map("sug_onboarding_campaigns")
+}
+
+// ============================================================================
+// DAY 15C: SUG GOVERNANCE, ROLES, LIVE ELECTIONS, PUBLIC FEED & NATIONWIDE CHAT
+// ============================================================================
+
+model SugRoleConfig {
+  id                     String       @id @default(uuid())
+  schoolId               String
+  school                 School       @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  title                  String
+  tier                   String       @default("SUG_CENTRAL") // SUG_CENTRAL | FACULTY | DEPARTMENT | COURSE_REP
+  unitId                 String?
+  unit                   AcademicUnit? @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  departmentId           String?
+  department             Department?  @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  description            String?
+  dueForElection         Boolean      @default(false)
+  isSelectionOpen        Boolean      @default(false)
+  eligibleLevelsJson     Json?        // e.g. ["500L"] or ["300L", "400L"]; empty/null = all levels in scope
+  maxEndorsementWinners  Int          @default(3)
+  canViewFinanceReadOnly Boolean      @default(false)
+  canPostPublicUpdates   Boolean      @default(true)
+  canPostOpportunities   Boolean      @default(false)
+  canManageWelfare       Boolean      @default(false)
+  canManageElections     Boolean      @default(false)
+  canPostInternal        Boolean      @default(true)
+  maxHolders             Int          @default(1)
+  sortOrder              Int          @default(0)
+  isActive               Boolean      @default(true)
+  holders                SugOfficeHolder[]
+  elections              SugElection[]
+  endorsementNominees    SugEndorsementNominee[]
+  endorsementVotes       SugEndorsementVote[]
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+
+  @@index([schoolId, tier, isActive])
+  @@map("sug_role_configs")
+}
+
+model SugOfficeHolder {
+  id             String        @id @default(uuid())
+  schoolId       String
+  school         School        @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  roleId         String
+  role           SugRoleConfig @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User          @relation("SugHolderUser", fields: [userId], references: [id], onDelete: Cascade)
+  unitId         String?
+  unit           AcademicUnit? @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  departmentId   String?
+  department     Department?   @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  classId        String?
+  schoolClass    SchoolClass?  @relation(fields: [classId], references: [id], onDelete: SetNull)
+  tenureLabel    String        @default("2025/2026")
+  manifestoOrBio String?       @db.Text
+  photoUrl       String?
+  appointedById  String?
+  isActive       Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([schoolId, isActive])
+  @@index([userId, isActive])
+  @@map("sug_office_holders")
+}
+
+model SugElection {
+  id           String                 @id @default(uuid())
+  schoolId     String
+  school       School                 @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  roleId       String
+  role         SugRoleConfig          @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  title        String
+  description  String?                @db.Text
+  scopeTier    String                 @default("SUG_CENTRAL") // SUG_CENTRAL | FACULTY | DEPARTMENT | COURSE_REP
+  unitId       String?
+  unit         AcademicUnit?          @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  departmentId String?
+  department   Department?            @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  status       String                 @default("UPCOMING") // UPCOMING | LIVE | CLOSED
+  startsAt     DateTime?
+  endsAt       DateTime?
+  createdById  String?
+  candidates   SugElectionCandidate[]
+  votes        SugElectionVote[]
+  createdAt    DateTime               @default(now())
+  updatedAt    DateTime               @updatedAt
+
+  @@index([schoolId, status])
+  @@map("sug_elections")
+}
+
+model SugElectionCandidate {
+  id             String            @id @default(uuid())
+  electionId     String
+  election       SugElection       @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  studentId      String?
+  student        User?             @relation("SugCandidateUser", fields: [studentId], references: [id], onDelete: SetNull)
+  fullName       String
+  photoUrl       String?
+  departmentName String
+  facultyName    String?
+  levelCode      String            @default("200L")
+  manifesto      String?           @db.Text
+  voteCount      Int               @default(0)
+  isApproved     Boolean           @default(true)
+  votes          SugElectionVote[]
+  createdAt      DateTime          @default(now())
+
+  @@index([electionId, voteCount])
+  @@map("sug_election_candidates")
+}
+
+model SugElectionVote {
+  id          String               @id @default(uuid())
+  electionId  String
+  election    SugElection          @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  candidateId String
+  candidate   SugElectionCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  voterId     String
+  voter       User                 @relation("SugVoterUser", fields: [voterId], references: [id], onDelete: Cascade)
+  createdAt   DateTime             @default(now())
+
+  @@unique([electionId, voterId])
+  @@index([electionId, candidateId])
+  @@map("sug_election_votes")
+}
+
+model SugPost {
+  id                 String   @id @default(uuid())
+  schoolId           String
+  school             School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  authorId           String?
+  author             User?    @relation("SugPostAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  authorRoleTitle    String   @default("SUG Executive")
+  category           String   @default("UPDATE") // UPDATE | ANNOUNCEMENT | SCHOLARSHIP | VACANCY | EVENT | INTERNAL_EXCO | FINANCE_REPORT
+  title              String
+  body               String   @db.Text
+  amountOrStipend    String?
+  deadline           String?
+  externalLink       String?
+  isInternalOnly     Boolean  @default(false)
+  isNationwidePublic Boolean  @default(false)
+  isPinned           Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([schoolId, isInternalOnly, createdAt])
+  @@index([isNationwidePublic, createdAt])
+  @@map("sug_posts")
+}
+
+model SugWelfareTicket {
+  id              String   @id @default(uuid())
+  schoolId        String
+  school          School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  reporterId      String
+  reporter        User     @relation("SugWelfareReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  category        String   @default("WELFARE") // WELFARE | BURSARY | HOSTEL_POWER | ACADEMIC_APPEAL | SAFETY
+  title           String
+  description     String   @db.Text
+  status          String   @default("OPEN") // OPEN | IN_REVIEW | RESOLVED
+  assignedToRole  String?
+  resolutionNote  String?  @db.Text
+  isPublicSummary Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([schoolId, status, createdAt])
+  @@index([reporterId])
+  @@map("sug_welfare_tickets")
+}
+
+model SugLeaderMessage {
+  id           String    @id @default(uuid())
+  schoolId     String?
+  school       School?   @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+  senderId     String
+  sender       User      @relation("SugMsgSender", fields: [senderId], references: [id], onDelete: Cascade)
+  recipientId  String
+  recipient    User      @relation("SugMsgRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  isNationwide Boolean   @default(false)
+  message      String    @db.Text
+  readAt       DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([senderId, recipientId, createdAt])
+  @@index([recipientId, readAt])
+  @@map("sug_leader_messages")
+}
+
+model SugEndorsementNominee {
+  id               String               @id @default(uuid())
+  schoolId         String
+  school           School               @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  roleId           String
+  role             SugRoleConfig        @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  nomineeUserId    String
+  nominee          User                 @relation("SugNomineeUser", fields: [nomineeUserId], references: [id], onDelete: Cascade)
+  nominatedById    String
+  nominatedBy      User                 @relation("SugNominatorUser", fields: [nominatedById], references: [id], onDelete: Cascade)
+  unitId           String?
+  departmentId     String?
+  fullName         String
+  photoUrl         String?
+  departmentName   String
+  facultyName      String?
+  levelCode        String               @default("200L")
+  manifesto        String?              @db.Text
+  endorsementCount Int                  @default(1)
+  status           String               @default("PENDING_ENDORSEMENT") // PENDING_ENDORSEMENT | APPROVED_FOR_ELECTION | REJECTED
+  approvedById     String?
+  endorsements     SugEndorsementVote[]
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  @@unique([roleId, nomineeUserId])
+  @@index([schoolId, roleId, endorsementCount])
+  @@map("sug_endorsement_nominees")
+}
+
+model SugEndorsementVote {
+  id        String                @id @default(uuid())
+  roleId    String
+  role      SugRoleConfig         @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  nomineeId String
+  nominee   SugEndorsementNominee @relation(fields: [nomineeId], references: [id], onDelete: Cascade)
+  voterId   String
+  voter     User                  @relation("SugEndorserUser", fields: [voterId], references: [id], onDelete: Cascade)
+  createdAt DateTime              @default(now())
+
+  @@unique([roleId, voterId])
+  @@index([nomineeId])
+  @@map("sug_endorsement_votes")
 }

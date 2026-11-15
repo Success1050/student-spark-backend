@@ -518,4 +518,83 @@ export class SchoolsController {
   ) {
     return this.schoolsService.updateSchoolSettings(schoolId, dto);
   }
+
+  // ============================================================================
+  // DAY 15B: SUG FAST ONBOARDING & STRIKE-PROOF CONTINUITY MODE
+  // ============================================================================
+
+  @Public()
+  @Get('sug/lookup/:code')
+  lookupSugCampaign(@Param('code') code: string) {
+    return this.schoolsService.lookupSugCampaign(code);
+  }
+
+  @Public()
+  @Post('sug/fast-onboard')
+  fastOnboardViaSug(
+    @Body()
+    dto: {
+      code: string;
+      fullName: string;
+      email: string;
+      matricNo?: string;
+      password: string;
+      departmentId?: string;
+      classId?: string;
+      level?: string;
+    },
+  ) {
+    return this.schoolsService.fastOnboardViaSug(dto);
+  }
+
+  @Get(':schoolId/sug/campaigns')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN', 'TEACHER')
+  @UseGuards(TenantGuard, RolesGuard)
+  listSugCampaigns(@Param('schoolId') schoolId: string) {
+    return this.schoolsService.listSugCampaigns(schoolId);
+  }
+
+  @Post(':schoolId/sug/campaigns')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('CREATE_SUG_CAMPAIGN', 'SugOnboardingCampaign')
+  createSugCampaign(
+    @Param('schoolId') schoolId: string,
+    @UserId() userId: string,
+    @Body()
+    dto: {
+      associationName: string;
+      code?: string;
+      facultyName?: string;
+      departmentId?: string;
+      defaultClassId?: string;
+      defaultLevel?: string;
+      proTrialDays?: number;
+      maxUses?: number | null;
+      welcomeMessage?: string;
+    },
+  ) {
+    return this.schoolsService.createSugCampaign(schoolId, userId, dto);
+  }
+
+  @Get(':schoolId/continuity-status')
+  getContinuityStatus(@Param('schoolId') schoolId: string) {
+    return this.schoolsService.getContinuityStatus(schoolId);
+  }
+
+  @Patch(':schoolId/continuity-status')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @UseGuards(TenantGuard, RolesGuard)
+  @AuditAction('UPDATE_CONTINUITY_STATUS', 'School')
+  updateContinuityStatus(
+    @Param('schoolId') schoolId: string,
+    @Body()
+    dto: {
+      mode: 'ACTIVE' | 'STRIKE_BREAK';
+      noticeTitle?: string;
+      noticeBody?: string;
+    },
+  ) {
+    return this.schoolsService.updateContinuityStatus(schoolId, dto);
+  }
 }

@@ -43,8 +43,8 @@ export const DEFAULT_PRIMARY_COMPONENTS: AssessmentComponentConfig[] = [
 ];
 
 export const DEFAULT_TERTIARY_COMPONENTS: AssessmentComponentConfig[] = [
-  { key: 'ca1', label: '1st CA / Quiz', maxScore: 15, role: 'CA', isOptional: false },
-  { key: 'ca2', label: '2nd CA / Assignment', maxScore: 15, role: 'CA', isOptional: true },
+  { key: 'ca1', label: 'Quiz 1', maxScore: 15, role: 'CA', isOptional: false },
+  { key: 'ca2', label: 'Take-Home / Quiz 2', maxScore: 15, role: 'CA', isOptional: true },
   { key: 'exam', label: 'Semester Exam', maxScore: 70, role: 'EXAM', isOptional: false },
 ];
 

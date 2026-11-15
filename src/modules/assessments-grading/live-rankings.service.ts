@@ -25,6 +25,8 @@ export type LiveRankingScope =
   | 'SCHOOL'
   | 'SCHOOL_TOP_10';
 
+export type LiveRankingMetricMode = 'SEMESTER_GPA' | 'CUMULATIVE_CGPA';
+
 export interface LiveRankingRow {
   rank: number | null;
   ordinal: string;
@@ -37,6 +39,7 @@ export interface LiveRankingRow {
   avatarUrl: string | null;
   classId: string;
   className: string;
+  levelCode: string | null;
   combinedKey: string;
   combinedLabel: string;
   departmentName: string | null;
@@ -44,10 +47,13 @@ export interface LiveRankingRow {
   averageScore: number;
   totalPoints: number;
   gpa: number;
+  cgpa: number;
   gpaScaleMax: number;
   totalUnits: number;
+  cumulativeUnits: number;
   gradedSubjectsCount: number;
   enrolledSubjectsCount: number;
+  cumulativeGradedCount: number;
   rating: number;
   letterGrade: string;
   bestSubject: { courseCode: string; name: string; score: number } | null;
@@ -267,6 +273,8 @@ export class LiveRankingsService {
       subjectId?: string;
       departmentId?: string;
       unitId?: string;
+      metricMode?: LiveRankingMetricMode;
+      levelCode?: string;
     },
   ) {
     const user = await this.prisma.user.findUnique({
@@ -277,8 +285,11 @@ export class LiveRankingsService {
         },
         teacherProfile: {
           include: {
-            assignedClasses: { select: { id: true } },
-            assignedSubjects: { select: { id: true, classId: true } },
+            department: { select: { id: true, name: true, unitId: true } },
+            assignedClasses: { select: { id: true, departmentId: true } },
+            assignedSubjects: {
+              select: { id: true, classId: true, departmentId: true },
+            },
           },
         },
         memberships: {
@@ -335,9 +346,11 @@ export class LiveRankingsService {
     await this.captureBaselineSnapshot(schoolId, resolvedTerm.id);
 
     // Determine role context & enforce student / teacher boundaries
-    let activeScope: LiveRankingScope = query.scope || (
-      effectiveRole === 'STUDENT' ? 'CLASS' : 'SCHOOL'
-    );
+    let activeScope: LiveRankingScope =
+      query.scope ||
+      (effectiveRole === 'STUDENT' || effectiveRole === 'TEACHER'
+        ? 'CLASS'
+        : 'SCHOOL');
 
     let studentContext: {
       myClassId: string | null;
@@ -346,6 +359,11 @@ export class LiveRankingsService {
       myCombinedLabel: string | null;
       myDeptCombinedKey: string | null;
       myDeptCombinedLabel: string | null;
+      myLevelCode: string | null;
+      myFacultyId: string | null;
+      myFacultyName: string | null;
+      myDepartmentId: string | null;
+      myDepartmentName: string | null;
     } | null = null;
 
     // Student class resolution
@@ -359,6 +377,30 @@ export class LiveRankingsService {
       ? dataset.classesMeta.find((c) => c.id === studentClassId) || null
       : null;
 
+    const normalizeLevelTag = (raw?: string | null): string => {
+      const m = String(raw || '').match(/(100|200|300|400|500|600|700|ND\s*[12]|HND\s*[12])/i);
+      if (m) return m[1].replace(/\s+/g, '').toUpperCase().replace(/^(\d{3})$/, '$1L');
+      return String(raw || '').trim().toUpperCase();
+    };
+    const studentLevelTag = studentClassMeta
+      ? normalizeLevelTag(studentClassMeta.levelCode || studentClassMeta.name)
+      : '';
+
+    const activeMetricMode: LiveRankingMetricMode =
+      dataset.isTertiary && activeScope !== 'SUBJECT' && query.metricMode === 'CUMULATIVE_CGPA'
+        ? 'CUMULATIVE_CGPA'
+        : 'SEMESTER_GPA';
+
+    if (dataset.isTertiary && activeMetricMode === 'CUMULATIVE_CGPA') {
+      if (effectiveRole === 'STUDENT') {
+        // Student Cumulative CGPA is strictly Faculty-wide across 100L to Final Year
+        activeScope = 'FACULTY';
+      } else if (effectiveRole === 'TEACHER') {
+        // Lecturer Cumulative CGPA is scoped to their own Department across its levels
+        activeScope = 'DEPARTMENT';
+      }
+    }
+
     if (effectiveRole === 'STUDENT') {
       studentContext = {
         myClassId: studentClassMeta?.id ?? null,
@@ -367,18 +409,24 @@ export class LiveRankingsService {
         myCombinedLabel: studentClassMeta?.cohort.combinedLabel ?? null,
         myDeptCombinedKey: studentClassMeta?.cohort.deptCombinedKey ?? null,
         myDeptCombinedLabel: studentClassMeta?.cohort.deptCombinedLabel ?? null,
+        myLevelCode: studentLevelTag || null,
+        myFacultyId: studentClassMeta?.unitId ?? null,
+        myFacultyName: studentClassMeta?.unitName ?? null,
+        myDepartmentId: studentClassMeta?.departmentId ?? null,
+        myDepartmentName: studentClassMeta?.departmentName ?? null,
       };
 
-      if (activeScope === 'SCHOOL') {
-        activeScope = 'SCHOOL_TOP_10';
+      if (activeScope === 'SCHOOL' || (dataset.isTertiary && activeScope === 'COMBINED_CLASS')) {
+        activeScope = dataset.isTertiary ? 'FACULTY' : 'SCHOOL_TOP_10';
       }
-      if (
-        activeScope !== 'CLASS' &&
-        activeScope !== 'COMBINED_CLASS' &&
-        activeScope !== 'SCHOOL_TOP_10'
-      ) {
+      const allowedStudentScopes: LiveRankingScope[] = dataset.isTertiary
+        ? ['CLASS', 'FACULTY']
+        : ['CLASS', 'COMBINED_CLASS', 'SCHOOL_TOP_10'];
+      if (!allowedStudentScopes.includes(activeScope)) {
         throw new ForbiddenException(
-          'Students can view live rankings for their own class, combined level, or Overall School Top 10.',
+          dataset.isTertiary
+            ? 'Students can only view rankings for their current level & department, or their current level across all departments in their Faculty.'
+            : 'Students can view live rankings for their own class, combined level, or Overall School Top 10.',
         );
       }
       if (activeScope === 'CLASS') {
@@ -387,11 +435,13 @@ export class LiveRankingsService {
         }
         if (query.classId && query.classId !== studentClassId) {
           throw new ForbiddenException(
-            'Students can only view live rankings for their own enrolled class.',
+            dataset.isTertiary
+              ? 'You can only view your own current level and department.'
+              : 'Students can only view live rankings for their own enrolled class.',
           );
         }
       }
-      if (activeScope === 'COMBINED_CLASS') {
+      if (activeScope === 'COMBINED_CLASS' && !dataset.isTertiary) {
         const targetCombKey =
           query.combinedKey ||
           studentClassMeta?.cohort.combinedKey ||
@@ -410,16 +460,25 @@ export class LiveRankingsService {
       }
     }
 
-    // Teacher assigned classes & subjects
+    // Teacher assigned classes, subjects & parent department
     const teacherAssignedClassIds = new Set<string>();
     const teacherAssignedSubjectIds = new Set<string>();
+    let teacherDepartmentId: string | null =
+      user.teacherProfile?.departmentId || null;
+
     if (effectiveRole === 'TEACHER') {
-      user.teacherProfile?.assignedClasses.forEach((c) =>
-        teacherAssignedClassIds.add(c.id),
-      );
+      user.teacherProfile?.assignedClasses.forEach((c) => {
+        teacherAssignedClassIds.add(c.id);
+        if (!teacherDepartmentId && c.departmentId) {
+          teacherDepartmentId = c.departmentId;
+        }
+      });
       user.teacherProfile?.assignedSubjects.forEach((s) => {
         teacherAssignedSubjectIds.add(s.id);
         if (s.classId) teacherAssignedClassIds.add(s.classId);
+        if (!teacherDepartmentId && s.departmentId) {
+          teacherDepartmentId = s.departmentId;
+        }
       });
       if (user.teacherProfile?.handlesAllSubjects) {
         dataset.subjectsMeta.forEach((subj) => {
@@ -430,28 +489,96 @@ export class LiveRankingsService {
       }
       const legacyClasses = await this.prisma.schoolClass.findMany({
         where: { schoolId, formTeacherId: userId },
-        select: { id: true },
+        select: { id: true, departmentId: true },
       });
-      legacyClasses.forEach((c) => teacherAssignedClassIds.add(c.id));
+      legacyClasses.forEach((c) => {
+        teacherAssignedClassIds.add(c.id);
+        if (!teacherDepartmentId && c.departmentId) {
+          teacherDepartmentId = c.departmentId;
+        }
+      });
       const legacySubjects = await this.prisma.schoolSubject.findMany({
         where: { schoolId, teacherId: userId },
-        select: { id: true, classId: true },
+        select: { id: true, classId: true, departmentId: true },
       });
       legacySubjects.forEach((s) => {
         teacherAssignedSubjectIds.add(s.id);
         if (s.classId) teacherAssignedClassIds.add(s.classId);
+        if (!teacherDepartmentId && s.departmentId) {
+          teacherDepartmentId = s.departmentId;
+        }
       });
+
+      if (dataset.isTertiary) {
+        if (!teacherDepartmentId && teacherAssignedClassIds.size > 0) {
+          const firstCls = dataset.classesMeta.find((c) =>
+            teacherAssignedClassIds.has(c.id),
+          );
+          teacherDepartmentId = firstCls?.departmentId ?? null;
+        }
+        if (
+          !['CLASS', 'DEPARTMENT', 'SUBJECT'].includes(activeScope)
+        ) {
+          if (!query.scope) {
+            activeScope = 'CLASS';
+          } else {
+            throw new ForbiddenException(
+              'Lecturers can only view standings for their assigned levels, assigned courses, and levels under their department.',
+            );
+          }
+        }
+      }
     }
+
+    // Determine level tag filter:
+    // - On Student Cumulative CGPA (100L to Final Year): always ALL levels combined by Faculty
+    // - On Tertiary STUDENT Semester GPA: strictly locked to student's current level
+    // - On Tertiary LECTURER / SCHOOL_ADMIN: filterable by levelCode (or ALL arranged in groupedSections)
+    const requestedLevelTag =
+      dataset.isTertiary &&
+      effectiveRole === 'STUDENT' &&
+      activeMetricMode === 'CUMULATIVE_CGPA'
+        ? ''
+        : dataset.isTertiary && effectiveRole === 'STUDENT'
+        ? studentLevelTag
+        : dataset.isTertiary && query.levelCode && query.levelCode !== 'ALL'
+        ? normalizeLevelTag(query.levelCode)
+        : '';
+    const matchesRequestedLevel = (r: LiveRankingRow) => {
+      if (!requestedLevelTag) return true;
+      return (
+        normalizeLevelTag(r.levelCode || r.className) === requestedLevelTag ||
+        normalizeLevelTag(r.combinedLabel) === requestedLevelTag
+      );
+    };
 
     // Filter dataset rows & compute scope standings
     let targetRows: LiveRankingRow[] = [];
     let scopeTitle = `${dataset.school.name} Live Standings`;
     let scopeSubtitle = dataset.isTertiary
-      ? 'Credit-weighted live GPA table'
+      ? activeMetricMode === 'CUMULATIVE_CGPA'
+        ? 'Cumulative CGPA across all semesters'
+        : 'Credit-weighted live Semester GPA table'
       : 'Live terminal average standings';
     let snapshotScopeKey = 'SCHOOL';
+    let facultyDepartmentLeaders: Array<{
+      departmentName: string;
+      levelLabel: string;
+      levelCode: string;
+      leader: LiveRankingRow;
+    }> = [];
 
     if (activeScope === 'CLASS') {
+      if (
+        dataset.isTertiary &&
+        effectiveRole === 'TEACHER' &&
+        query.classId &&
+        !teacherAssignedClassIds.has(query.classId)
+      ) {
+        throw new ForbiddenException(
+          'Lecturers can only view assigned level standings for levels they teach.',
+        );
+      }
       const targetClassId =
         effectiveRole === 'STUDENT'
           ? studentClassId!
@@ -461,28 +588,62 @@ export class LiveRankingsService {
               : dataset.classesMeta[0]?.id);
       const clsMeta = dataset.classesMeta.find((c) => c.id === targetClassId);
       if (!clsMeta) {
-        throw new NotFoundException('Target class or cohort not found.');
+        if (dataset.isTertiary && effectiveRole === 'TEACHER') {
+          targetRows = [];
+          scopeTitle = 'No Assigned Levels Yet';
+          scopeSubtitle =
+            'No level/course has been assigned to you yet. Switch to "My Dept (All Levels)" to inspect your department.';
+          snapshotScopeKey = `LECTURER:${userId}`;
+        } else {
+          throw new NotFoundException('Target class or cohort not found.');
+        }
+      } else {
+        targetRows = dataset.allStudentRows.filter((r) => r.classId === clsMeta.id);
+        scopeTitle = `${clsMeta.name} Live Table`;
+        scopeSubtitle = `${clsMeta.departmentName ? `${clsMeta.departmentName} • ` : ''}${targetRows.length} enrolled student(s)`;
+        snapshotScopeKey = `CLASS:${clsMeta.id}`;
       }
-      targetRows = dataset.allStudentRows.filter((r) => r.classId === clsMeta.id);
-      scopeTitle = `${clsMeta.name} Live Table`;
-      scopeSubtitle = `${clsMeta.departmentName ? `${clsMeta.departmentName} • ` : ''}${targetRows.length} enrolled student(s)`;
-      snapshotScopeKey = `CLASS:${clsMeta.id}`;
     } else if (activeScope === 'COMBINED_CLASS') {
-      const defaultKey =
-        studentClassMeta?.cohort.combinedKey ||
-        dataset.combinedCohorts.find((c) => c.isCombined)?.key ||
-        dataset.combinedCohorts[0]?.key;
-      const targetKey = query.combinedKey || defaultKey;
-      const comb = dataset.combinedCohorts.find((c) => c.key === targetKey);
-      if (!comb) {
-        throw new NotFoundException('Combined class / level group not found.');
+      if (dataset.isTertiary && effectiveRole === 'STUDENT' && studentLevelTag) {
+        targetRows = dataset.allStudentRows.filter(
+          (r) =>
+            normalizeLevelTag(r.levelCode || r.className) === studentLevelTag,
+        );
+        scopeTitle = `All ${studentLevelTag} Students Across ${dataset.school.name}`;
+        scopeSubtitle = `Combines all ${studentLevelTag} students across every Faculty & Department • ${targetRows.length} student(s)`;
+        snapshotScopeKey = `LEVEL_SCHOOL:${studentLevelTag}`;
+      } else {
+        const defaultKey =
+          studentClassMeta?.cohort.combinedKey ||
+          dataset.combinedCohorts.find((c) => c.isCombined)?.key ||
+          dataset.combinedCohorts[0]?.key;
+        const targetKey = query.combinedKey || defaultKey;
+        const comb = dataset.combinedCohorts.find((c) => c.key === targetKey);
+        if (!comb) {
+          throw new NotFoundException('Combined class / level group not found.');
+        }
+        const idSet = new Set(comb.classIds);
+        targetRows = dataset.allStudentRows.filter((r) => idSet.has(r.classId));
+        if (dataset.isTertiary) {
+          scopeTitle = `All ${comb.label} Across Campus`;
+          scopeSubtitle = `Combines ${comb.armNames.join(', ')} across faculties • ${targetRows.length} student(s)`;
+        } else {
+          scopeTitle = `${comb.label} (${comb.isCombined ? 'Combined Arms' : 'Full Level'})`;
+          scopeSubtitle = `Merged: ${comb.armNames.join(', ')} • ${targetRows.length} student(s)`;
+        }
+        snapshotScopeKey = `COMBINED:${comb.key}`;
       }
-      const idSet = new Set(comb.classIds);
-      targetRows = dataset.allStudentRows.filter((r) => idSet.has(r.classId));
-      scopeTitle = `${comb.label} (${comb.isCombined ? 'Combined Arms' : 'Full Level'})`;
-      scopeSubtitle = `Merged: ${comb.armNames.join(', ')} • ${targetRows.length} student(s)`;
-      snapshotScopeKey = `COMBINED:${comb.key}`;
     } else if (activeScope === 'SUBJECT') {
+      if (
+        dataset.isTertiary &&
+        effectiveRole === 'TEACHER' &&
+        query.subjectId &&
+        !teacherAssignedSubjectIds.has(query.subjectId)
+      ) {
+        throw new ForbiddenException(
+          'Lecturers can only view standings for courses assigned to them.',
+        );
+      }
       const targetSubjectId =
         query.subjectId ||
         (effectiveRole === 'TEACHER'
@@ -490,44 +651,162 @@ export class LiveRankingsService {
           : dataset.subjectsMeta[0]?.id);
       const subj = dataset.subjectsMeta.find((s) => s.id === targetSubjectId);
       if (!subj) {
-        throw new NotFoundException('Course / subject not found.');
+        if (dataset.isTertiary && effectiveRole === 'TEACHER') {
+          targetRows = [];
+          scopeTitle = 'No Assigned Courses Yet';
+          scopeSubtitle = 'No courses assigned to your profile for this semester.';
+          snapshotScopeKey = `LECTURER_SUBJ:${userId}`;
+        } else {
+          throw new NotFoundException('Course / subject not found.');
+        }
+      } else {
+        targetRows = this.buildSubjectRows(dataset, subj.id);
+        scopeTitle = `${subj.name} (${subj.courseCode})`;
+        scopeSubtitle = `${subj.className} • Live subject score standings`;
+        snapshotScopeKey = `SUBJECT:${subj.id}`;
       }
-      targetRows = this.buildSubjectRows(dataset, subj.id);
-      scopeTitle = `${subj.name} (${subj.courseCode})`;
-      scopeSubtitle = `${subj.className} • Live subject score standings`;
-      snapshotScopeKey = `SUBJECT:${subj.id}`;
     } else if (activeScope === 'DEPARTMENT') {
-      const targetDeptId = query.departmentId || dataset.departmentsMeta[0]?.id;
+      if (
+        dataset.isTertiary &&
+        effectiveRole === 'TEACHER' &&
+        query.departmentId &&
+        teacherDepartmentId &&
+        query.departmentId !== teacherDepartmentId
+      ) {
+        throw new ForbiddenException(
+          'Lecturers can only view rankings for levels under the department they belong to.',
+        );
+      }
+      const fallbackDeptForUnit =
+        query.unitId
+          ? dataset.departmentsMeta.find((d) => d.unitId === query.unitId)?.id
+          : undefined;
+      const targetDeptId =
+        dataset.isTertiary && effectiveRole === 'TEACHER'
+          ? teacherDepartmentId || dataset.departmentsMeta[0]?.id
+          : query.departmentId ||
+            fallbackDeptForUnit ||
+            (effectiveRole === 'STUDENT'
+              ? user.studentProfile?.departmentId || undefined
+              : undefined) ||
+            dataset.departmentsMeta[0]?.id;
       const dept = dataset.departmentsMeta.find((d) => d.id === targetDeptId);
       if (!dept) throw new NotFoundException('Department not found.');
       targetRows = dataset.allStudentRows.filter(
         (r) =>
           dataset.classesMeta.find((c) => c.id === r.classId)?.departmentId ===
-          dept.id,
+            dept.id && matchesRequestedLevel(r),
       );
-      scopeTitle = `${dept.name} Standings`;
-      scopeSubtitle = `All levels in ${dept.code} • ${targetRows.length} student(s)`;
+      scopeTitle = `${dept.name}${requestedLevelTag ? ` • ${requestedLevelTag}` : ' (All Levels)'}`;
+      scopeSubtitle = `${
+        activeMetricMode === 'CUMULATIVE_CGPA' ? 'Cumulative CGPA • ' : ''
+      }${requestedLevelTag || 'All levels'} under ${dept.name} • ${targetRows.length} student(s)`;
       snapshotScopeKey = `DEPT:${dept.id}`;
     } else if (activeScope === 'FACULTY') {
-      const targetUnitId = query.unitId || dataset.unitsMeta[0]?.id;
+      const profileDeptUnitId = user.studentProfile?.departmentId
+        ? dataset.departmentsMeta.find((d) => d.id === user.studentProfile?.departmentId)
+            ?.unitId ?? undefined
+        : undefined;
+      const studentUnitId = studentClassMeta?.unitId || profileDeptUnitId;
+      const targetUnitId =
+        effectiveRole === 'STUDENT'
+          ? studentUnitId || dataset.unitsMeta[0]?.id
+          : query.unitId || dataset.unitsMeta[0]?.id;
       const unit = dataset.unitsMeta.find((u) => u.id === targetUnitId);
       if (!unit) throw new NotFoundException('Faculty / Section not found.');
-      targetRows = dataset.allStudentRows.filter(
-        (r) =>
-          dataset.classesMeta.find((c) => c.id === r.classId)?.unitId === unit.id,
+      const unitDeptIds = new Set(
+        dataset.departmentsMeta
+          .filter((d) => d.unitId === unit.id)
+          .map((d) => d.id),
       );
-      scopeTitle = `${unit.name} Standings`;
-      scopeSubtitle = `${targetRows.length} enrolled student(s)`;
+      const scopedDeptInFaculty =
+        dataset.isTertiary &&
+        effectiveRole !== 'STUDENT' &&
+        query.departmentId &&
+        dataset.departmentsMeta.some(
+          (d) => d.id === query.departmentId && d.unitId === unit.id,
+        )
+          ? query.departmentId
+          : undefined;
+      const facultyAllRows = dataset.allStudentRows.filter((r) => {
+        const cls = dataset.classesMeta.find((c) => c.id === r.classId);
+        const matchesUnit =
+          cls?.unitId === unit.id ||
+          (cls?.departmentId ? unitDeptIds.has(cls.departmentId) : false) ||
+          r.unitName === unit.name;
+        if (!matchesUnit) return false;
+        if (scopedDeptInFaculty && cls?.departmentId !== scopedDeptInFaculty) {
+          return false;
+        }
+        return true;
+      });
+      targetRows = facultyAllRows.filter(matchesRequestedLevel);
+
+      if (dataset.isTertiary) {
+        // Group top #1 leader for each (Department + Level) under this Faculty
+        const byDeptLevel = new Map<string, LiveRankingRow[]>();
+        for (const r of targetRows) {
+          const deptName = r.departmentName || 'General';
+          const lvlLabel = r.className || normalizeLevelTag(r.levelCode) || 'Level';
+          const key = `${deptName}::${lvlLabel}`;
+          const arr = byDeptLevel.get(key) || [];
+          arr.push(r);
+          byDeptLevel.set(key, arr);
+        }
+        for (const [k, groupRows] of byDeptLevel.entries()) {
+          const rankedGroup = this.rankRows(
+            groupRows,
+            true,
+            undefined,
+            userId,
+            activeMetricMode,
+          );
+          const topLeader = rankedGroup.find((g) => g.rank === 1);
+          if (topLeader) {
+            const [departmentName, levelLabel] = k.split('::');
+            facultyDepartmentLeaders.push({
+              departmentName,
+              levelLabel,
+              levelCode: normalizeLevelTag(topLeader.levelCode || levelLabel),
+              leader: topLeader,
+            });
+          }
+        }
+        facultyDepartmentLeaders.sort((a, b) =>
+          `${a.departmentName} ${a.levelCode}`.localeCompare(
+            `${b.departmentName} ${b.levelCode}`,
+          ),
+        );
+      }
+
+      const pickedDeptName = scopedDeptInFaculty
+        ? dataset.departmentsMeta.find((d) => d.id === scopedDeptInFaculty)?.name
+        : null;
+      if (dataset.isTertiary && activeMetricMode === 'CUMULATIVE_CGPA') {
+        scopeTitle = `${pickedDeptName || unit.name} • Cumulative CGPA`;
+        scopeSubtitle = pickedDeptName
+          ? `Overall CGPA across all levels under ${pickedDeptName} (${unit.code || unit.name}) • ${targetRows.length} student(s)`
+          : `Overall CGPA from 100L to Final Level across all departments in ${unit.code || unit.name} • ${targetRows.length} student(s)`;
+      } else {
+        scopeTitle = `${pickedDeptName || unit.name}${requestedLevelTag ? ` • ${requestedLevelTag}` : ''} Standings`;
+        scopeSubtitle = pickedDeptName
+          ? `${requestedLevelTag || 'All levels'} under ${pickedDeptName} • ${targetRows.length} student(s)`
+          : `${
+              requestedLevelTag
+                ? `All ${requestedLevelTag} departments in ${unit.code || unit.name} combined • `
+                : `All levels in ${unit.code || unit.name} arranged by Department & Level • `
+            }${targetRows.length} student(s)`;
+      }
       snapshotScopeKey = `UNIT:${unit.id}`;
     } else {
-      targetRows = [...dataset.allStudentRows];
+      targetRows = dataset.allStudentRows.filter(matchesRequestedLevel);
       scopeTitle =
         activeScope === 'SCHOOL_TOP_10'
-          ? 'Overall School Top 10'
-          : `${dataset.school.name} • Overall Leaderboard`;
+          ? `${dataset.isTertiary ? 'Campus' : 'Overall School'} Top 10${requestedLevelTag ? ` (${requestedLevelTag})` : ''}`
+          : `${dataset.school.name} • ${activeMetricMode === 'CUMULATIVE_CGPA' ? 'Cumulative CGPA Leaderboard' : 'Overall Leaderboard'}`;
       scopeSubtitle =
         activeScope === 'SCHOOL_TOP_10'
-          ? `Top 10 performers across all classes & levels`
+          ? `Top 10 performers ${requestedLevelTag ? `in ${requestedLevelTag}` : 'across all levels'}`
           : `All ${targetRows.length} enrolled students ranked live`;
       snapshotScopeKey = 'SCHOOL';
     }
@@ -542,6 +821,7 @@ export class LiveRankingsService {
       activeScope === 'SUBJECT' ? false : dataset.isTertiary,
       prevMap,
       userId,
+      activeMetricMode,
     );
 
     const myStanding = rankedAll.find((r) => r.studentId === userId) || null;
@@ -566,6 +846,97 @@ export class LiveRankingsService {
         : 0;
 
     // Shape available scope selectors according to user's role
+    const lecturerDepartmentLevels =
+      dataset.isTertiary && effectiveRole === 'TEACHER'
+        ? Array.from(
+            new Set(
+              dataset.classesMeta
+                .filter((c) =>
+                  teacherDepartmentId ? c.departmentId === teacherDepartmentId : false,
+                )
+                .map((c) => normalizeLevelTag(c.levelCode || c.name))
+                .filter(Boolean),
+            ),
+          ).sort()
+        : [];
+
+    const groupedSections: Array<{
+      key: string;
+      facultyName: string;
+      departmentName: string;
+      levelCode: string;
+      levelLabel: string;
+      leaderName: string | null;
+      leaderScore: number | null;
+      rows: LiveRankingRow[];
+    }> = [];
+
+    if (
+      dataset.isTertiary &&
+      effectiveRole !== 'STUDENT' &&
+      ['SCHOOL', 'FACULTY', 'DEPARTMENT'].includes(activeScope)
+    ) {
+      const groupBuckets = new Map<
+        string,
+        {
+          facultyName: string;
+          departmentName: string;
+          levelCode: string;
+          levelLabel: string;
+          rawRows: LiveRankingRow[];
+        }
+      >();
+      for (const r of targetRows) {
+        const facultyName = r.unitName || 'Campus';
+        const departmentName = r.departmentName || 'General Department';
+        const levelCode = normalizeLevelTag(r.levelCode || r.className) || 'LEVEL';
+        const levelLabel = r.className || levelCode;
+        const gKey = `${facultyName}::${departmentName}::${levelCode}`;
+        const existing = groupBuckets.get(gKey) || {
+          facultyName,
+          departmentName,
+          levelCode,
+          levelLabel,
+          rawRows: [],
+        };
+        existing.rawRows.push(r);
+        groupBuckets.set(gKey, existing);
+      }
+
+      const sortedEntries = Array.from(groupBuckets.entries()).sort(([, a], [, b]) => {
+        const fCmp = a.facultyName.localeCompare(b.facultyName);
+        if (fCmp !== 0) return fCmp;
+        const dCmp = a.departmentName.localeCompare(b.departmentName);
+        if (dCmp !== 0) return dCmp;
+        return a.levelCode.localeCompare(b.levelCode);
+      });
+
+      for (const [key, bucket] of sortedEntries) {
+        const rankedGroup = this.rankRows(
+          bucket.rawRows,
+          true,
+          prevMap,
+          userId,
+          activeMetricMode,
+        );
+        const topRow = rankedGroup.find((g) => g.rank === 1) || null;
+        groupedSections.push({
+          key,
+          facultyName: bucket.facultyName,
+          departmentName: bucket.departmentName,
+          levelCode: bucket.levelCode,
+          levelLabel: bucket.levelLabel,
+          leaderName: topRow?.fullName || null,
+          leaderScore: topRow
+            ? activeMetricMode === 'CUMULATIVE_CGPA'
+              ? topRow.cgpa
+              : topRow.gpa
+            : null,
+          rows: rankedGroup,
+        });
+      }
+    }
+
     const availableClasses =
       effectiveRole === 'STUDENT'
         ? dataset.classesMeta
@@ -579,10 +950,11 @@ export class LiveRankingsService {
             }))
         : effectiveRole === 'TEACHER'
         ? dataset.classesMeta
-            .filter(
-              (c) =>
-                teacherAssignedClassIds.size === 0 ||
-                teacherAssignedClassIds.has(c.id),
+            .filter((c) =>
+              dataset.isTertiary
+                ? teacherAssignedClassIds.has(c.id)
+                : teacherAssignedClassIds.size === 0 ||
+                  teacherAssignedClassIds.has(c.id),
             )
             .map((c) => ({
               id: c.id,
@@ -607,21 +979,24 @@ export class LiveRankingsService {
               comb.key === studentClassMeta?.cohort.deptCombinedKey,
           )
         : effectiveRole === 'TEACHER'
-        ? dataset.combinedCohorts.filter(
-            (comb) =>
-              teacherAssignedClassIds.size === 0 ||
-              comb.classIds.some((id) => teacherAssignedClassIds.has(id)),
-          )
+        ? dataset.isTertiary
+          ? []
+          : dataset.combinedCohorts.filter(
+              (comb) =>
+                teacherAssignedClassIds.size === 0 ||
+                comb.classIds.some((id) => teacherAssignedClassIds.has(id)),
+            )
         : dataset.combinedCohorts;
 
     const availableSubjects =
       effectiveRole === 'STUDENT'
         ? []
         : effectiveRole === 'TEACHER'
-        ? dataset.subjectsMeta.filter(
-            (s) =>
-              teacherAssignedSubjectIds.size === 0 ||
-              teacherAssignedSubjectIds.has(s.id),
+        ? dataset.subjectsMeta.filter((s) =>
+            dataset.isTertiary
+              ? teacherAssignedSubjectIds.has(s.id)
+              : teacherAssignedSubjectIds.size === 0 ||
+                teacherAssignedSubjectIds.has(s.id),
           )
         : dataset.subjectsMeta;
 
@@ -643,6 +1018,8 @@ export class LiveRankingsService {
       terms: allTerms,
       role: effectiveRole,
       activeScope,
+      activeMetricMode,
+      selectedLevelCode: requestedLevelTag || 'ALL',
       scopeTitle,
       scopeSubtitle,
       studentContext,
@@ -651,14 +1028,39 @@ export class LiveRankingsService {
         classes: availableClasses,
         combinedClasses: availableCombined,
         subjects: availableSubjects,
-        departments: effectiveRole === 'STUDENT' ? [] : dataset.departmentsMeta,
-        faculties: effectiveRole === 'STUDENT' ? [] : dataset.unitsMeta,
+        departments:
+          effectiveRole === 'STUDENT'
+            ? []
+            : dataset.isTertiary && effectiveRole === 'TEACHER'
+            ? teacherDepartmentId
+              ? dataset.departmentsMeta.filter((d) => d.id === teacherDepartmentId)
+              : []
+            : dataset.departmentsMeta,
+        faculties:
+          effectiveRole === 'STUDENT'
+            ? dataset.isTertiary && studentClassMeta?.unitId
+              ? dataset.unitsMeta.filter((u) => u.id === studentClassMeta.unitId)
+              : []
+            : dataset.isTertiary && effectiveRole === 'TEACHER'
+            ? []
+            : dataset.unitsMeta,
+        levels:
+          dataset.isTertiary && effectiveRole === 'TEACHER'
+            ? lecturerDepartmentLevels
+            : dataset.isTertiary && effectiveRole !== 'STUDENT'
+            ? dataset.levelsMeta
+            : [],
       },
+      facultyDepartmentLeaders,
+      groupedSections,
       summary: {
         totalParticipants: rankedAll.length,
         gradedParticipants: rankedOnly.length,
         topAverageScore: rankedOnly[0]?.averageScore ?? 0,
-        topGpa: rankedOnly[0]?.gpa ?? 0,
+        topGpa:
+          activeMetricMode === 'CUMULATIVE_CGPA'
+            ? rankedOnly[0]?.cgpa ?? 0
+            : rankedOnly[0]?.gpa ?? 0,
         scopeAverageScore,
         passRate:
           rankedOnly.length > 0
@@ -701,6 +1103,7 @@ export class LiveRankingsService {
       subjects,
       studentUsers,
       grades,
+      allSchoolGrades,
     ] = await Promise.all([
       this.prisma.assessmentConfig.findFirst({
         where: { schoolId, subjectId: null },
@@ -764,6 +1167,17 @@ export class LiveRankingsService {
           },
         },
       }),
+      isTertiary
+        ? this.prisma.studentSubjectGrade.findMany({
+            where: { schoolId },
+            select: {
+              studentId: true,
+              totalScore: true,
+              gradePoint: true,
+              subject: { select: { creditUnits: true } },
+            },
+          })
+        : Promise.resolve([]),
     ]);
 
     const gpaScaleMax = Number(schoolConfig?.gpaScaleMax) || 5.0;
@@ -797,12 +1211,25 @@ export class LiveRankingsService {
     }));
     const classMetaById = new Map(classesMeta.map((c) => [c.id, c]));
 
-    // Group grades by studentId
+    // Group grades by studentId (current term) & all terms (for cumulative CGPA)
     const gradesByStudent = new Map<string, typeof grades>();
     for (const g of grades) {
       const list = gradesByStudent.get(g.studentId) || [];
       list.push(g);
       gradesByStudent.set(g.studentId, list);
+    }
+
+    const cumulativeGradesByStudent = new Map<
+      string,
+      Array<{ gradePoint: number; units: number }>
+    >();
+    for (const g of allSchoolGrades) {
+      const list = cumulativeGradesByStudent.get(g.studentId) || [];
+      list.push({
+        gradePoint: Number(g.gradePoint) || 0,
+        units: Math.max(1, Number(g.subject?.creditUnits) || 1),
+      });
+      cumulativeGradesByStudent.set(g.studentId, list);
     }
 
     // Build unified student rows (including enrolled students awaiting scores)
@@ -830,6 +1257,7 @@ export class LiveRankingsService {
           matricOrAdmissionNo: stu.studentProfile?.matricOrAdmissionNo || '—',
           clsMeta,
           stuGrades,
+          cumulativeGrades: cumulativeGradesByStudent.get(stu.id) || [],
           enrolledSubjectsCount,
           isTertiary,
           gpaScaleMax,
@@ -905,6 +1333,19 @@ export class LiveRankingsService {
       }))
       .sort((a, b) => a.label.localeCompare(b.label));
 
+    const levelsSet = new Set<string>();
+    for (const cls of classesMeta) {
+      const m = String(cls.levelCode || cls.name || '').match(
+        /(100|200|300|400|500|600|700|ND\s*[12]|HND\s*[12])/i,
+      );
+      if (m) {
+        levelsSet.add(
+          m[1].replace(/\s+/g, '').toUpperCase().replace(/^(\d{3})$/, '$1L'),
+        );
+      }
+    }
+    const levelsMeta = Array.from(levelsSet).sort();
+
     return {
       school,
       term: {
@@ -919,8 +1360,10 @@ export class LiveRankingsService {
         id: d.id,
         name: d.name,
         code: d.code,
+        unitId: d.unit?.id ?? null,
         unitName: d.unit?.name ?? null,
       })),
+      levelsMeta,
       classesMeta,
       subjectsMeta: subjects.map((s) => ({
         id: s.id,
@@ -945,6 +1388,7 @@ export class LiveRankingsService {
     clsMeta?: {
       id: string;
       name: string;
+      levelCode?: string | null;
       departmentName: string | null;
       unitName: string | null;
       cohort: { combinedKey: string; combinedLabel: string };
@@ -956,6 +1400,7 @@ export class LiveRankingsService {
       updatedAt: Date;
       subject: { id: string; name: string; courseCode: string; creditUnits: number | null };
     }>;
+    cumulativeGrades?: Array<{ gradePoint: number; units: number }>;
     enrolledSubjectsCount: number;
     isTertiary: boolean;
     gpaScaleMax: number;
@@ -998,6 +1443,19 @@ export class LiveRankingsService {
         ? Math.round((weightedQuality / totalUnits) * 100) / 100
         : 0;
 
+    let cumQuality = 0;
+    let cumUnits = 0;
+    const cumList = params.cumulativeGrades || [];
+    for (const cg of cumList) {
+      cumQuality += cg.gradePoint * cg.units;
+      cumUnits += cg.units;
+    }
+    const cgpa =
+      cumUnits > 0 ? Math.round((cumQuality / cumUnits) * 100) / 100 : gpa;
+    const cumulativeUnits = cumUnits > 0 ? cumUnits : totalUnits;
+    const cumulativeGradedCount =
+      cumList.length > 0 ? cumList.length : gradedSubjectsCount;
+
     // SofaScore 1.0 - 10.0 Rating derived dynamically
     const rating =
       gradedSubjectsCount === 0
@@ -1038,6 +1496,7 @@ export class LiveRankingsService {
       avatarUrl: params.avatarUrl,
       classId: params.clsMeta?.id ?? '',
       className: params.clsMeta?.name ?? 'Unassigned',
+      levelCode: params.clsMeta?.levelCode ?? null,
       combinedKey: params.clsMeta?.cohort.combinedKey ?? 'GENERAL',
       combinedLabel: params.clsMeta?.cohort.combinedLabel ?? 'General',
       departmentName: params.clsMeta?.departmentName ?? null,
@@ -1045,10 +1504,13 @@ export class LiveRankingsService {
       averageScore,
       totalPoints: Math.round(totalPoints * 100) / 100,
       gpa,
+      cgpa,
       gpaScaleMax: params.gpaScaleMax,
       totalUnits,
+      cumulativeUnits,
       gradedSubjectsCount,
       enrolledSubjectsCount: params.enrolledSubjectsCount,
+      cumulativeGradedCount,
       rating,
       letterGrade: band?.grade ?? '—',
       bestSubject,
@@ -1118,15 +1580,22 @@ export class LiveRankingsService {
     useGpaPrimary: boolean,
     prevMap?: Map<string, number>,
     currentUserId?: string,
+    metricMode: LiveRankingMetricMode = 'SEMESTER_GPA',
   ): LiveRankingRow[] {
-    const graded = rows.filter((r) => r.gradedSubjectsCount > 0);
+    const isCgpa = useGpaPrimary && metricMode === 'CUMULATIVE_CGPA';
+    const hasGradedWork = (r: LiveRankingRow) =>
+      isCgpa ? r.cumulativeGradedCount > 0 : r.gradedSubjectsCount > 0;
+    const primaryScore = (r: LiveRankingRow) =>
+      isCgpa ? r.cgpa : useGpaPrimary ? r.gpa : r.averageScore;
+
+    const graded = rows.filter(hasGradedWork);
     const pending = rows
-      .filter((r) => r.gradedSubjectsCount === 0)
+      .filter((r) => !hasGradedWork(r))
       .sort((a, b) => a.fullName.localeCompare(b.fullName));
 
     const sortedGraded = [...graded].sort((a, b) => {
-      if (useGpaPrimary && Math.abs(b.gpa - a.gpa) > 0.001) {
-        return b.gpa - a.gpa;
+      if (useGpaPrimary && Math.abs(primaryScore(b) - primaryScore(a)) > 0.001) {
+        return primaryScore(b) - primaryScore(a);
       }
       if (Math.abs(b.averageScore - a.averageScore) > 0.001) {
         return b.averageScore - a.averageScore;
@@ -1141,7 +1610,7 @@ export class LiveRankingsService {
     let prevPrimaryVal: number | null = null;
 
     const rankedGraded: LiveRankingRow[] = sortedGraded.map((row, idx) => {
-      const primaryVal = useGpaPrimary ? row.gpa : row.averageScore;
+      const primaryVal = primaryScore(row);
       const isTied =
         prevPrimaryVal !== null && Math.abs(primaryVal - prevPrimaryVal) <= 0.001;
       if (!isTied) {

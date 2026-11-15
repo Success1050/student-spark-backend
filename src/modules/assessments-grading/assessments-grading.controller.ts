@@ -43,6 +43,8 @@ export class AssessmentsGradingController {
     @Query('subjectId') subjectId?: string,
     @Query('departmentId') departmentId?: string,
     @Query('unitId') unitId?: string,
+    @Query('metricMode') metricMode?: 'SEMESTER_GPA' | 'CUMULATIVE_CGPA',
+    @Query('levelCode') levelCode?: string,
   ) {
     return this.liveRankingsService.getLiveRankings(userId, schoolId, {
       scope,
@@ -53,6 +55,8 @@ export class AssessmentsGradingController {
       subjectId,
       departmentId,
       unitId,
+      metricMode,
+      levelCode,
     });
   }
 

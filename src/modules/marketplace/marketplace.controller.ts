@@ -15,7 +15,7 @@ import {
 } from './dto/marketplace.dto.js';
 import { UserId } from '../../common/decorators/user-id.decorator.js';
 
-@Controller('marketplace')
+@Controller(['marketplace', 'api/marketplace'])
 export class MarketplaceController {
   constructor(private readonly marketplaceService: MarketplaceService) {}
 
@@ -72,5 +72,25 @@ export class MarketplaceController {
   @Post('items/:id/download')
   recordDownload(@Param('id') id: string) {
     return this.marketplaceService.recordDownload(id);
+  }
+
+  @Get('lecturer/royalties')
+  getLecturerRoyalties(@UserId() userId: string) {
+    return this.marketplaceService.getLecturerRoyaltiesSummary(userId);
+  }
+
+  @Post('lecturer/nuban')
+  configureLecturerNuban(
+    @UserId() userId: string,
+    @Body()
+    dto: {
+      bankCode: string;
+      bankName: string;
+      accountNumber: string;
+      businessName?: string;
+      percentageCharge?: number;
+    },
+  ) {
+    return this.marketplaceService.configureLecturerRoyaltyNuban(userId, dto);
   }
 }
