@@ -464,9 +464,13 @@ export class MarketplaceService {
       const buf = Buffer.from(cleanB64, 'base64');
       if (buf.length > 0) {
         resolvedFileSize = buf.length;
+        const baseName = (
+          dto.fileName || `${dto.title.replace(/\s+/g, '_').toLowerCase()}.pdf`
+        ).replace(/[^a-zA-Z0-9._-]/g, '_');
+        const storageName = `${Date.now()}_${baseName}`;
         const uploaded = await this.storage.uploadPdfBuffer(
           buf,
-          dto.fileName || `${dto.title.replace(/\s+/g, '_').toLowerCase()}.pdf`,
+          storageName,
           'marketplace',
         );
         fileUrl = uploaded.publicUrl;
@@ -908,7 +912,8 @@ export class MarketplaceService {
       format: item.format || 'PDF',
       isFree: item.isFree,
       attachedFileUrl: item.encryptedFileUrl?.startsWith('http')
-        ? item.encryptedFileUrl
+        ? this.storage.getAccessiblePdfUrl(item.encryptedFileUrl) ||
+          item.encryptedFileUrl
         : null,
       watermarkText: watermark.watermarkText,
       studentIdentifier: watermark.studentIdentifier,

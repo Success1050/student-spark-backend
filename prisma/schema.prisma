@@ -239,6 +239,13 @@ model School {
   sugWelfareTickets         SugWelfareTicket[]
   sugLeaderMessages         SugLeaderMessage[]
   sugEndorsementNominees    SugEndorsementNominee[]
+  paymentAccounts           PaymentAccount[]
+  feeStructures             FeeStructure[]
+  studentInvoices           StudentInvoice[]
+  financePayments           FinancePayment[]
+  reconciliationBatches     ReconciliationBatch[]
+  financeReceipts           FinanceReceipt[]
+  financialAuditLogs        FinancialAuditLog[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -274,6 +281,7 @@ model AcademicTerm {
   subjectGrades       StudentSubjectGrade[]
   reportCards         TerminalReportCard[]
   feeItems            SchoolFeeItem[]
+  feeStructures       FeeStructure[]
   calendarEvents      SchoolCalendarEvent[]
   createdAt           DateTime              @default(now())
   updatedAt           DateTime              @updatedAt
@@ -319,6 +327,8 @@ model AcademicUnit {
   sugRoleConfigs   SugRoleConfig[]
   sugOfficeHolders SugOfficeHolder[]
   sugElections     SugElection[]
+  paymentAccounts  PaymentAccount[]
+  feeStructures    FeeStructure[]
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 
@@ -346,6 +356,8 @@ model Department {
   sugRoleConfigs            SugRoleConfig[]
   sugOfficeHolders          SugOfficeHolder[]
   sugElections              SugElection[]
+  paymentAccounts           PaymentAccount[]
+  feeStructures             FeeStructure[]
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
 
@@ -383,6 +395,7 @@ model SchoolClass {
   courseRepAttendanceSlips CourseRepAttendanceSlip[]
   sugOnboardingCampaigns   SugOnboardingCampaign[]
   sugOfficeHolders         SugOfficeHolder[]
+  feeStructures            FeeStructure[]
   createdAt          DateTime              @default(now())
   updatedAt          DateTime              @updatedAt
 
@@ -522,6 +535,16 @@ model User {
   sugEndorsementsReceived   SugEndorsementNominee[]    @relation("SugNomineeUser")
   sugNominationsMade        SugEndorsementNominee[]    @relation("SugNominatorUser")
   sugEndorsementVotes       SugEndorsementVote[]       @relation("SugEndorserUser")
+  studentInvoices           StudentInvoice[]           @relation("StudentInvoices")
+  studentPayments           FinancePayment[]           @relation("StudentPayments")
+  recordedPayments          FinancePayment[]           @relation("RecordedPayments")
+  verifiedPayments          FinancePayment[]           @relation("VerifiedPayments")
+  paymentEvidences          PaymentEvidence[]          @relation("StudentEvidences")
+  reviewedEvidences         PaymentEvidence[]          @relation("ReviewedEvidences")
+  createdFeeStructures      FeeStructure[]             @relation("FeeStructureCreator")
+  uploadedReconciliationBatches ReconciliationBatch[]  @relation("ReconciliationUploader")
+  studentReceipts           FinanceReceipt[]           @relation("StudentReceipts")
+  financialAuditLogs        FinancialAuditLog[]        @relation("ActorFinancialAudits")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1678,4 +1701,265 @@ model SugEndorsementVote {
   @@unique([roleId, voterId])
   @@index([nomineeId])
   @@map("sug_endorsement_votes")
+}
+
+// ============================================================================
+// DAY 16: ENTERPRISE INSTITUTION FINANCE, 4 PAYMENT CHANNELS & DIGITAL CLEARANCE
+// ============================================================================
+
+model PaymentAccount {
+  id                     String           @id @default(uuid())
+  schoolId               String
+  school                 School           @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  accountName            String
+  accountNumber          String
+  bankName               String
+  bankCode               String?
+  accountType            String           @default("CENTRAL_BURSARY") // CENTRAL_BURSARY | FACULTY_ACCOUNT | DEPARTMENTAL_ACCOUNT | OTHER
+  unitId                 String?
+  unit                   AcademicUnit?    @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  departmentId           String?
+  department             Department?      @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  isDefault              Boolean          @default(false)
+  isActive               Boolean          @default(true)
+  description            String?
+  paystackSubaccountCode String?
+  feeStructures          FeeStructure[]
+  payments               FinancePayment[]
+  reconciliationBatches  ReconciliationBatch[]
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+
+  @@index([schoolId, isActive])
+  @@map("payment_accounts")
+}
+
+model FeeStructure {
+  id                  String           @id @default(uuid())
+  schoolId            String
+  school              School           @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  title               String
+  code                String
+  sessionName         String           @default("2025/2026")
+  termId              String?
+  term                AcademicTerm?    @relation(fields: [termId], references: [id], onDelete: SetNull)
+  termOrSemester      String?
+  targetScope         String           @default("WHOLE_SCHOOL") // WHOLE_SCHOOL | FACULTY | DEPARTMENT | LEVEL_OR_CLASS
+  unitId              String?
+  unit                AcademicUnit?    @relation(fields: [unitId], references: [id], onDelete: SetNull)
+  departmentId        String?
+  department          Department?      @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  classId             String?
+  class               SchoolClass?     @relation(fields: [classId], references: [id], onDelete: SetNull)
+  levelName           String?          // e.g. "100L", "200L", "ND 1", "JSS 1"
+  paymentAccountId    String?
+  paymentAccount      PaymentAccount?  @relation(fields: [paymentAccountId], references: [id], onDelete: SetNull)
+  dueDate             DateTime?
+  isMandatory         Boolean          @default(true)
+  allowPartialPayment Boolean          @default(true)
+  minimumPartialKobo  Int              @default(0)
+  totalAmountKobo     Int              @default(0)
+  isPublished         Boolean          @default(true)
+  createdById         String?
+  createdBy           User?            @relation("FeeStructureCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  feeItems            FeeItem[]
+  invoices            StudentInvoice[]
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  @@index([schoolId, targetScope, isPublished])
+  @@map("fee_structures")
+}
+
+model FeeItem {
+  id             String              @id @default(uuid())
+  feeStructureId String
+  feeStructure   FeeStructure        @relation(fields: [feeStructureId], references: [id], onDelete: Cascade)
+  name           String
+  amountKobo     Int
+  isOptional     Boolean             @default(false)
+  sortOrder      Int                 @default(0)
+  allocations    PaymentAllocation[]
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@index([feeStructureId])
+  @@map("fee_items")
+}
+
+model StudentInvoice {
+  id                String            @id @default(uuid())
+  schoolId          String
+  school            School            @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  studentId         String
+  student           User              @relation("StudentInvoices", fields: [studentId], references: [id], onDelete: Cascade)
+  feeStructureId    String
+  feeStructure      FeeStructure      @relation(fields: [feeStructureId], references: [id], onDelete: Cascade)
+  invoiceNumber     String            @unique
+  totalAmountKobo   Int
+  paidAmountKobo    Int               @default(0)
+  balanceAmountKobo Int
+  status            String            @default("UNPAID") // UNPAID | PARTIALLY_PAID | PAID | WAIVED | OVERDUE
+  dueDate           DateTime?
+  clearedAt         DateTime?
+  qrClearanceToken  String            @unique
+  notes             String?
+  payments          FinancePayment[]
+  evidences         PaymentEvidence[]
+  receipts          FinanceReceipt[]
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@index([schoolId, studentId, status])
+  @@index([schoolId, feeStructureId])
+  @@map("student_invoices")
+}
+
+model FinancePayment {
+  id                String              @id @default(uuid())
+  schoolId          String
+  school            School              @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  studentId         String
+  student           User                @relation("StudentPayments", fields: [studentId], references: [id], onDelete: Cascade)
+  invoiceId         String?
+  invoice           StudentInvoice?     @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  paymentAccountId  String?
+  paymentAccount    PaymentAccount?     @relation(fields: [paymentAccountId], references: [id], onDelete: SetNull)
+  amountKobo        Int
+  channel           String              @default("PAYSTACK") // PAYSTACK | BANK_TRANSFER | CASH | POS
+  status            String              @default("VERIFIED") // PENDING | VERIFIED | REJECTED | FAILED
+  reference         String              @unique
+  paystackReference String?             @unique
+  posTerminalRef    String?
+  bankTellerNo      String?
+  recordedById      String?
+  recordedBy        User?               @relation("RecordedPayments", fields: [recordedById], references: [id], onDelete: SetNull)
+  verifiedById      String?
+  verifiedBy        User?               @relation("VerifiedPayments", fields: [verifiedById], references: [id], onDelete: SetNull)
+  verifiedAt        DateTime?
+  rejectionReason   String?
+  receiptNumber     String?             @unique
+  qrReceiptToken    String?             @unique
+  metadataJson      Json?
+  paidAt            DateTime            @default(now())
+  allocations       PaymentAllocation[]
+  evidence          PaymentEvidence?
+  receipt           FinanceReceipt?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@index([schoolId, studentId, channel])
+  @@index([schoolId, paidAt])
+  @@map("finance_payments")
+}
+
+model PaymentAllocation {
+  id         String         @id @default(uuid())
+  paymentId  String
+  payment    FinancePayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  feeItemId  String
+  feeItem    FeeItem        @relation(fields: [feeItemId], references: [id], onDelete: Cascade)
+  amountKobo Int
+  createdAt  DateTime       @default(now())
+
+  @@index([paymentId])
+  @@index([feeItemId])
+  @@map("payment_allocations")
+}
+
+model PaymentEvidence {
+  id                 String          @id @default(uuid())
+  paymentId          String?         @unique
+  payment            FinancePayment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  invoiceId          String
+  invoice            StudentInvoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  studentId          String
+  student            User            @relation("StudentEvidences", fields: [studentId], references: [id], onDelete: Cascade)
+  payerName          String
+  payerBankName      String?
+  transferAmountKobo Int
+  transferDate       DateTime        @default(now())
+  proofImageUrl      String
+  submissionNotes    String?
+  status             String          @default("PENDING") // PENDING | APPROVED | REJECTED
+  reviewedById       String?
+  reviewedBy         User?           @relation("ReviewedEvidences", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt         DateTime?
+  reviewNotes        String?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  @@index([invoiceId, status])
+  @@index([studentId, status])
+  @@map("payment_evidences")
+}
+
+model ReconciliationBatch {
+  id               String          @id @default(uuid())
+  schoolId         String
+  school           School          @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  paymentAccountId String?
+  paymentAccount   PaymentAccount? @relation(fields: [paymentAccountId], references: [id], onDelete: SetNull)
+  uploadedById     String
+  uploadedBy       User            @relation("ReconciliationUploader", fields: [uploadedById], references: [id], onDelete: Cascade)
+  fileName         String
+  totalRows        Int             @default(0)
+  matchedRows      Int             @default(0)
+  unmatchedRows    Int             @default(0)
+  totalAmountKobo  BigInt          @default(0)
+  status           String          @default("COMPLETED") // PROCESSING | COMPLETED | FAILED
+  resultsJson      Json?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([schoolId, createdAt])
+  @@map("reconciliation_batches")
+}
+
+model FinanceReceipt {
+  id                       String         @id @default(uuid())
+  schoolId                 String
+  school                   School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  paymentId                String         @unique
+  payment                  FinancePayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoiceId                String
+  invoice                  StudentInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  studentId                String
+  student                  User           @relation("StudentReceipts", fields: [studentId], references: [id], onDelete: Cascade)
+  receiptNumber            String         @unique
+  qrToken                  String         @unique
+  amountKobo               Int
+  payerFullName            String
+  payerMatricOrAdmissionNo String?
+  academicSession          String
+  feeCategory              String
+  status                   String         @default("ISSUED") // ISSUED | CANCELLED
+  issuedAt                 DateTime       @default(now())
+  createdAt                DateTime       @default(now())
+  updatedAt                DateTime       @updatedAt
+
+  @@index([schoolId, studentId])
+  @@index([receiptNumber])
+  @@index([qrToken])
+  @@map("finance_receipts")
+}
+
+model FinancialAuditLog {
+  id         String   @id @default(uuid())
+  schoolId   String
+  school     School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  actorId    String
+  actor      User     @relation("ActorFinancialAudits", fields: [actorId], references: [id], onDelete: Cascade)
+  actorRole  String
+  action     String   // FEE_STRUCTURE_CREATED | PAYMENT_RECORDED_CASH | PAYMENT_RECORDED_POS | TRANSFER_PROOF_APPROVED | TRANSFER_PROOF_REJECTED | INVOICE_WAIVED | BANK_RECONCILIATION_COMPLETED | ACCOUNT_CREATED
+  entityType String   // FeeStructure | StudentInvoice | FinancePayment | PaymentEvidence | ReconciliationBatch | PaymentAccount
+  entityId   String
+  amountKobo Int?
+  diffJson   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([schoolId, action, createdAt])
+  @@index([actorId, createdAt])
+  @@map("financial_audit_logs")
 }

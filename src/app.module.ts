@@ -29,6 +29,7 @@ import { AuditLogModule } from './modules/audit-log/audit-log.module.js';
 import { TeacherModule } from './modules/teacher/teacher.module.js';
 import { CourseRepModule } from './modules/course-rep/course-rep.module.js';
 import { SugModule } from './modules/sug/sug.module.js';
+import { FinanceModule } from './modules/finance/finance.module.js';
 import { UserContextMiddleware } from './common/middleware/user-context.middleware.js';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { AuditLogInterceptor } from './common/interceptors/audit-log.interceptor.js';
@@ -72,6 +73,7 @@ import { AuditLogInterceptor } from './common/interceptors/audit-log.interceptor
     TeacherModule,
     CourseRepModule,
     SugModule,
+    FinanceModule,
   ],
   controllers: [AppController],
   providers: [
