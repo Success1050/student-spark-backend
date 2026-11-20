@@ -118,6 +118,29 @@ export class NotificationsService {
     return { removed: true };
   }
 
+  private resolveFallbackDeepLink(category?: string | null): string {
+    const cat = String(category || '').toUpperCase();
+    switch (cat) {
+      case 'COMMUNITY':
+        return '/communities';
+      case 'FINANCE':
+      case 'PAYMENTS':
+        return '/studentFees';
+      case 'WALLET':
+        return '/referrals';
+      case 'GAMES':
+      case 'GAME':
+      case 'GAME_BATTLE':
+        return '/games';
+      case 'STUDY':
+        return '/(main)/notesQuizes';
+      case 'ANNOUNCEMENT':
+        return '/sugHub';
+      default:
+        return '/(main)/Home';
+    }
+  }
+
   async dispatchNotification(params: DispatchNotificationParams) {
     const {
       userId,
@@ -136,6 +159,10 @@ export class NotificationsService {
     if (!userId || !title || !body) {
       return null;
     }
+
+    const resolvedDeepLink =
+      (typeof deepLink === 'string' && deepLink.trim()) ||
+      this.resolveFallbackDeepLink(category);
 
     try {
       const user = await this.prisma.user.findUnique({
@@ -156,7 +183,7 @@ export class NotificationsService {
             title,
             body,
             category: String(category).toUpperCase(),
-            deepLink,
+            deepLink: resolvedDeepLink,
             dataJson: (dataJson || {}) as object,
             isRead: false,
           },
@@ -184,8 +211,9 @@ export class NotificationsService {
           body,
           data: {
             ...(dataJson || {}),
-            category,
-            deepLink: deepLink || '/(main)/Home',
+            category: String(category).toUpperCase(),
+            route: resolvedDeepLink,
+            deepLink: resolvedDeepLink,
             notificationId: formattedNotification?.id,
           },
         });

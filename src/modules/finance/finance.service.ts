@@ -4,14 +4,19 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { PrismaService } from '../../database/prisma.service.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
 import { StorageService } from '../storage/storage.service.js';
+import { FinanceGateway } from './finance.gateway.js';
 import {
   CreateFeeStructureDto,
+  UpdateFeeStructureDto,
   CreatePaymentAccountDto,
   UpdatePaymentAccountDto,
+  ApproveFeeStructureDto,
+  RejectFeeStructureDto,
   InitOnlinePaymentDto,
   ReconciliationCsvDto,
   RecordWalkInPaymentDto,
@@ -23,16 +28,122 @@ import {
 @Injectable()
 export class FinanceService {
   private readonly logger = new Logger(FinanceService.name);
+  private readonly pendingInvoiceSyncs = new Map<string, Promise<void>>();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
     private readonly notifications: NotificationsService,
+    @Optional() private readonly financeGateway?: FinanceGateway,
   ) {}
 
   // ============================================================================
   // 1. PAYMENT ACCOUNTS (INSTITUTION & FACULTY BANK ACCOUNTS)
   // ============================================================================
+
+  /**
+   * Automatically provisions or retrieves an active Paystack subaccount for a school bank account.
+   * Eliminates manual subaccount code entry by calling Paystack's API behind the scenes.
+   */
+  private async autoProvisionPaystackSubaccount(
+    businessName: string,
+    settlementBankCode: string,
+    accountNumber: string,
+    description?: string,
+  ): Promise<string | null> {
+    const secret = process.env.PAYSTACK_SECRET_KEY;
+    if (!secret || secret.includes('placeholder')) {
+      return null;
+    }
+
+    const cleanBank = settlementBankCode.trim();
+    const cleanAcc = accountNumber.trim();
+    const cleanName = businessName.trim() || 'Institution Collection Account';
+
+    try {
+      // 1. Check if a subaccount already exists on Paystack for this account number
+      const listRes = await fetch('https://api.paystack.co/subaccount?perPage=100', {
+        headers: { Authorization: `Bearer ${secret}` },
+        signal: AbortSignal.timeout(6000),
+      });
+      const listData = (await listRes.json()) as any;
+      if (listData?.status && Array.isArray(listData.data)) {
+        // Paystack returns settlement_bank as a bank NAME (e.g. "Moniepoint MFB"), not a code,
+        // so match on the 10-digit NUBAN (unique enough in practice) + active status.
+        const existing = listData.data.find(
+          (sub: any) => String(sub.account_number) === cleanAcc && !!sub.active,
+        );
+        if (existing?.subaccount_code) {
+          this.logger.log(
+            `Found existing active Paystack subaccount ${existing.subaccount_code} for ${cleanAcc}`,
+          );
+          return existing.subaccount_code;
+        }
+      }
+
+      // 2. Provision new subaccount on Paystack
+      const createRes = await fetch('https://api.paystack.co/subaccount', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          business_name: cleanName,
+          settlement_bank: cleanBank,
+          account_number: cleanAcc,
+          // Platform (main account) share of each payment. Mirrors the "Your share of payment (%)"
+          // field on the Paystack dashboard. Configurable via env; can still be edited per school on Paystack.
+          percentage_charge: Math.min(
+            100,
+            Math.max(0, Number(process.env.PAYSTACK_SCHOOL_SPLIT_PERCENT ?? 0) || 0),
+          ),
+          description: description || cleanName,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      const createData = (await createRes.json()) as any;
+      if (createData?.status && createData?.data?.subaccount_code) {
+        this.logger.log(
+          `Successfully auto-provisioned Paystack subaccount ${createData.data.subaccount_code} for ${cleanAcc}`,
+        );
+        return createData.data.subaccount_code;
+      } else {
+        this.logger.warn(
+          `Paystack subaccount auto-provision notice: ${createData?.message || 'Could not provision'}. Proceeding without subaccount.`,
+        );
+        return null;
+      }
+    } catch (err: any) {
+      this.logger.warn(
+        `Failed to auto-provision Paystack subaccount: ${err?.message || err}. Safe fallback active.`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Option B monetisation: flat platform convenience fee (kobo) added ON TOP of the school fee.
+   * The school's subaccount receives exactly the invoice amount; the platform keeps this fee.
+   * Configure via PLATFORM_CONVENIENCE_FEE_KOBO (e.g. 30000 = ₦300). 0 disables it.
+   */
+  getPlatformFeeKobo(): number {
+    const raw = Number(process.env.PLATFORM_CONVENIENCE_FEE_KOBO ?? 0);
+    return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 0;
+  }
+
+  /**
+   * Converts a verified Paystack amount into the portion that should be credited to the invoice.
+   * Uses `requested_amount` (excludes Paystack fees passed to the customer) and strips the platform fee.
+   */
+  private extractSchoolPrincipalKobo(paystackData: any): number {
+    const base = Number(paystackData?.requested_amount) || Number(paystackData?.amount) || 0;
+    const metaFee = Number(paystackData?.metadata?.platformFeeKobo) || 0;
+    // Use the larger of configured vs recorded fee so a tampered metadata value can never over-credit.
+    const fee = Math.max(this.getPlatformFeeKobo(), metaFee);
+    return base > fee ? base - fee : base;
+  }
 
   async getPaymentAccounts(schoolId: string) {
     return this.prisma.paymentAccount.findMany({
@@ -58,6 +169,22 @@ export class FinanceService {
       });
     }
 
+    let subaccountCode = dto.paystackSubaccountCode?.trim() || null;
+
+    // Auto-provision Paystack subaccount if not provided, using verified bankCode & NUBAN
+    if (!subaccountCode && dto.bankCode && dto.accountNumber) {
+      const school = await this.prisma.school.findUnique({
+        where: { id: schoolId },
+        select: { name: true },
+      });
+      subaccountCode = await this.autoProvisionPaystackSubaccount(
+        dto.accountName.trim(),
+        dto.bankCode.trim(),
+        dto.accountNumber.trim(),
+        `${school?.name || 'School'} ${dto.accountType || 'Central Bursary'}`,
+      );
+    }
+
     const account = await this.prisma.paymentAccount.create({
       data: {
         schoolId,
@@ -70,7 +197,7 @@ export class FinanceService {
         departmentId: dto.departmentId,
         isDefault: dto.isDefault ?? false,
         description: dto.description?.trim(),
-        paystackSubaccountCode: dto.paystackSubaccountCode?.trim(),
+        paystackSubaccountCode: subaccountCode,
       },
       include: {
         unit: { select: { id: true, name: true, code: true } },
@@ -89,6 +216,7 @@ export class FinanceService {
         bankName: account.bankName,
         accountNumber: account.accountNumber,
         accountName: account.accountName,
+        paystackSubaccountCode: account.paystackSubaccountCode,
       },
     });
 
@@ -127,6 +255,38 @@ export class FinanceService {
       });
     }
 
+    let subaccountCode =
+      dto.paystackSubaccountCode !== undefined
+        ? dto.paystackSubaccountCode?.trim() || null
+        : account.paystackSubaccountCode;
+
+    const targetBankCode = dto.bankCode !== undefined ? dto.bankCode?.trim() : account.bankCode;
+    const targetAccNumber =
+      dto.accountNumber !== undefined ? dto.accountNumber.trim() : account.accountNumber;
+    const targetAccName =
+      dto.accountName !== undefined ? dto.accountName.trim() : account.accountName;
+
+    // If bank details changed or no subaccount exists yet, auto-provision
+    const bankChanged =
+      (dto.bankCode && dto.bankCode.trim() !== account.bankCode) ||
+      (dto.accountNumber && dto.accountNumber.trim() !== account.accountNumber);
+
+    if ((!subaccountCode || bankChanged) && targetBankCode && targetAccNumber) {
+      const school = await this.prisma.school.findUnique({
+        where: { id: schoolId },
+        select: { name: true },
+      });
+      const autoCode = await this.autoProvisionPaystackSubaccount(
+        targetAccName,
+        targetBankCode,
+        targetAccNumber,
+        `${school?.name || 'School'} ${dto.accountType || account.accountType}`,
+      );
+      if (autoCode) {
+        subaccountCode = autoCode;
+      }
+    }
+
     const updated = await this.prisma.paymentAccount.update({
       where: { id: accountId },
       data: {
@@ -139,10 +299,7 @@ export class FinanceService {
         departmentId: dto.departmentId !== undefined ? dto.departmentId : undefined,
         isDefault: dto.isDefault !== undefined ? dto.isDefault : undefined,
         description: dto.description !== undefined ? dto.description?.trim() : undefined,
-        paystackSubaccountCode:
-          dto.paystackSubaccountCode !== undefined
-            ? dto.paystackSubaccountCode?.trim()
-            : undefined,
+        paystackSubaccountCode: subaccountCode,
       },
       include: {
         unit: { select: { id: true, name: true, code: true } },
@@ -162,11 +319,13 @@ export class FinanceService {
           bankName: account.bankName,
           accountNumber: account.accountNumber,
           accountName: account.accountName,
+          paystackSubaccountCode: account.paystackSubaccountCode,
         },
         current: {
           bankName: updated.bankName,
           accountNumber: updated.accountNumber,
           accountName: updated.accountName,
+          paystackSubaccountCode: updated.paystackSubaccountCode,
         },
       },
     });
@@ -350,13 +509,134 @@ export class FinanceService {
   // 2. FEE STRUCTURES & BREAKDOWN ITEMS (FACULTY/DEPT/LEVEL SCOPED)
   // ============================================================================
 
+  async getFinanceConfigOptions(schoolId: string) {
+    const [school, classes, sessions, units, departments] = await Promise.all([
+      this.prisma.school.findUnique({
+        where: { id: schoolId },
+        select: {
+          id: true,
+          name: true,
+          schoolCode: true,
+          institutionType: true,
+        },
+      }),
+      this.prisma.schoolClass.findMany({
+        where: { schoolId },
+        select: {
+          id: true,
+          name: true,
+          levelCode: true,
+          termOrSemester: true,
+          departmentId: true,
+          department: { select: { id: true, name: true, code: true } },
+          _count: {
+            select: {
+              studentProfiles: true,
+              students: true,
+              enrollments: true,
+            },
+          },
+        },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.academicSession.findMany({
+        where: { schoolId },
+        include: {
+          terms: { orderBy: { createdAt: 'asc' } },
+        },
+        orderBy: [{ isCurrent: 'desc' }, { createdAt: 'desc' }],
+      }),
+      this.prisma.academicUnit.findMany({
+        where: { schoolId },
+        select: { id: true, name: true, code: true, unitType: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.department.findMany({
+        where: { schoolId },
+        select: { id: true, name: true, code: true, unitId: true },
+        orderBy: { name: 'asc' },
+      }),
+    ]);
+
+    const instUpper = String(school?.institutionType || '').toUpperCase();
+    const isTertiary = ['UNIVERSITY', 'POLYTECHNIC', 'COLLEGE_OF_EDUCATION', 'TERTIARY'].includes(
+      instUpper,
+    );
+
+    const allSchoolInvoices = await this.prisma.studentInvoice.findMany({
+      where: { schoolId },
+      select: {
+        paidAmountKobo: true,
+        balanceAmountKobo: true,
+        status: true,
+        student: {
+          select: {
+            classId: true,
+            studentProfile: { select: { classId: true } },
+          },
+        },
+        feeStructure: { select: { classId: true } },
+      },
+    });
+
+    const classStatsMap = new Map<
+      string,
+      { paidCount: number; halfPaidCount: number; unpaidCount: number; totalCount: number }
+    >();
+    for (const inv of allSchoolInvoices) {
+      const cid =
+        inv.student?.studentProfile?.classId ||
+        inv.student?.classId ||
+        inv.feeStructure?.classId ||
+        null;
+      if (!cid) continue;
+      const stats = classStatsMap.get(cid) || {
+        paidCount: 0,
+        halfPaidCount: 0,
+        unpaidCount: 0,
+        totalCount: 0,
+      };
+      stats.totalCount += 1;
+      if (inv.status === 'PAID' || inv.balanceAmountKobo <= 0) {
+        stats.paidCount += 1;
+      } else if (inv.paidAmountKobo > 0 && inv.balanceAmountKobo > 0) {
+        stats.halfPaidCount += 1;
+      } else {
+        stats.unpaidCount += 1;
+      }
+      classStatsMap.set(cid, stats);
+    }
+
+    const enrichedClasses = classes.map((cls) => ({
+      ...cls,
+      invoiceStats: classStatsMap.get(cls.id) || {
+        paidCount: 0,
+        halfPaidCount: 0,
+        unpaidCount: 0,
+        totalCount: 0,
+      },
+    }));
+
+    return {
+      school: school ? { ...school, isTertiary } : null,
+      classes: enrichedClasses,
+      sessions,
+      units,
+      departments,
+    };
+  }
+
   async getFeeStructures(
     schoolId: string,
     filters?: {
       targetScope?: string;
       unitId?: string;
       departmentId?: string;
+      classId?: string;
+      termId?: string;
       levelName?: string;
+      approvalStatus?: string;
+      onlyPublished?: boolean;
     },
   ) {
     return this.prisma.feeStructure.findMany({
@@ -365,14 +645,21 @@ export class FinanceService {
         ...(filters?.targetScope ? { targetScope: filters.targetScope } : {}),
         ...(filters?.unitId ? { unitId: filters.unitId } : {}),
         ...(filters?.departmentId ? { departmentId: filters.departmentId } : {}),
+        ...(filters?.classId ? { classId: filters.classId } : {}),
+        ...(filters?.termId ? { termId: filters.termId } : {}),
         ...(filters?.levelName ? { levelName: filters.levelName } : {}),
+        ...(filters?.approvalStatus ? { approvalStatus: filters.approvalStatus } : {}),
+        ...(filters?.onlyPublished ? { isPublished: true, approvalStatus: 'APPROVED' } : {}),
       },
       include: {
         feeItems: { orderBy: { sortOrder: 'asc' } },
         paymentAccount: true,
         unit: { select: { id: true, name: true, code: true } },
         department: { select: { id: true, name: true, code: true } },
-        class: { select: { id: true, name: true } },
+        class: { select: { id: true, name: true, levelCode: true } },
+        term: { select: { id: true, name: true } },
+        createdBy: { select: { id: true, fullName: true, role: true } },
+        approvedBy: { select: { id: true, fullName: true, role: true } },
         _count: { select: { invoices: true } },
       },
       orderBy: { createdAt: 'desc' },
@@ -394,7 +681,7 @@ export class FinanceService {
       0,
     );
 
-    let paymentAccountId = dto.paymentAccountId;
+    let paymentAccountId = dto.paymentAccountId?.trim() || undefined;
     if (!paymentAccountId) {
       const defaultAcc = await this.prisma.paymentAccount.findFirst({
         where: { schoolId, isDefault: true, isActive: true },
@@ -402,25 +689,173 @@ export class FinanceService {
       paymentAccountId = defaultAcc?.id;
     }
 
+    const isBursar = actorRole === 'SCHOOL_FINANCE';
+    const approvalStatus = isBursar ? 'PENDING_APPROVAL' : 'APPROVED';
+    const isPublished = !isBursar;
+    const approvedById = isBursar ? null : actorId;
+    const approvedAt = isBursar ? null : new Date();
+
+    const billingPeriod =
+      dto.billingPeriod ||
+      (dto.termOrSemester?.toUpperCase().includes('TERM') ? 'PER_TERM' : 'PER_SESSION');
+
+    // Enforce current active term only: fees cannot be created for previous or future terms
+    const activeTerm = await this.prisma.academicTerm.findFirst({
+      where: { isCurrent: true, session: { schoolId } },
+      include: { session: true },
+    });
+    if (activeTerm && dto.termId?.trim() && dto.termId.trim() !== activeTerm.id) {
+      throw new BadRequestException(
+        'Fees can only be created for the current active term. Creating fees for previous or future terms is not allowed.',
+      );
+    }
+
+    const effectiveTermId = activeTerm?.id || dto.termId?.trim() || null;
+    const effectiveTermName = activeTerm?.name || dto.termOrSemester?.trim() || null;
+    const effectiveSessionName =
+      activeTerm?.session?.name || dto.sessionName?.trim() || '2025/2026';
+
+    const targetScope = dto.targetScope || 'WHOLE_SCHOOL';
+
+    const rawClassIds =
+      Array.isArray(dto.classIds) && dto.classIds.length > 0
+        ? Array.from(new Set(dto.classIds.map((id) => id?.trim()).filter(Boolean) as string[]))
+        : dto.classId?.trim()
+          ? [dto.classId.trim()]
+          : [];
+
+    const includeRelations = {
+      feeItems: { orderBy: { sortOrder: 'asc' as const } },
+      paymentAccount: true,
+      unit: { select: { id: true, name: true, code: true } },
+      department: { select: { id: true, name: true, code: true } },
+      class: { select: { id: true, name: true, levelCode: true } },
+      term: { select: { id: true, name: true } },
+      createdBy: { select: { id: true, fullName: true, role: true } },
+      approvedBy: { select: { id: true, fullName: true, role: true } },
+      _count: { select: { invoices: true } },
+    };
+
+    if (targetScope === 'LEVEL_OR_CLASS' && rawClassIds.length > 1) {
+      const selectedClasses = await this.prisma.schoolClass.findMany({
+        where: { schoolId, id: { in: rawClassIds } },
+        orderBy: { name: 'asc' },
+      });
+      if (selectedClasses.length === 0) {
+        throw new BadRequestException('Selected classes were not found in this institution.');
+      }
+
+      const createdStructures: any[] = [];
+      let totalGeneratedInvoicesCount = 0;
+
+      for (const cls of selectedClasses) {
+        const classTitle = dto.title.toLowerCase().includes(cls.name.toLowerCase())
+          ? dto.title.trim()
+          : `${dto.title.trim()} (${cls.name})`;
+        const classCodeSuffix =
+          cls.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase() || cls.id.slice(0, 4).toUpperCase();
+        const classCode = `${dto.code.trim().toUpperCase()}-${classCodeSuffix}`;
+
+        const created = await this.prisma.feeStructure.create({
+          data: {
+            schoolId,
+            title: classTitle,
+            code: classCode,
+            sessionName: effectiveSessionName,
+            termId: effectiveTermId,
+            termOrSemester: effectiveTermName,
+            targetScope,
+            unitId: null,
+            departmentId: null,
+            classId: cls.id,
+            levelName: dto.levelName?.trim() || null,
+            paymentAccountId: paymentAccountId || null,
+            dueDate: dto.dueDate ? new Date(dto.dueDate) : undefined,
+            isMandatory: dto.isMandatory ?? true,
+            allowPartialPayment: dto.allowPartialPayment ?? true,
+            minimumPartialKobo: dto.minimumPartialKobo ?? 0,
+            totalAmountKobo: totalKobo,
+            isPublished,
+            approvalStatus,
+            approvedById,
+            approvedAt,
+            billingPeriod,
+            createdById: actorId,
+            feeItems: {
+              create: dto.items.map((item, idx) => ({
+                name: item.name.trim(),
+                amountKobo: Number(item.amountKobo) || 0,
+                isOptional: item.isOptional ?? false,
+                sortOrder: item.sortOrder ?? idx + 1,
+              })),
+            },
+          },
+          include: includeRelations,
+        });
+
+        let invCount = 0;
+        if (isPublished && dto.autoGenerateInvoices !== false) {
+          invCount = await this.generateInvoicesForFeeStructure(schoolId, created.id);
+          totalGeneratedInvoicesCount += invCount;
+        }
+
+        await this.logFinancialAudit({
+          schoolId,
+          actorId,
+          actorRole,
+          action: 'FEE_STRUCTURE_CREATED',
+          entityType: 'FeeStructure',
+          entityId: created.id,
+          amountKobo: totalKobo,
+          diffJson: {
+            title: created.title,
+            code: created.code,
+            targetScope: created.targetScope,
+            classId: created.classId,
+            termId: created.termId,
+            billingPeriod,
+            approvalStatus,
+            generatedInvoicesCount: invCount,
+          },
+        });
+
+        createdStructures.push(created);
+      }
+
+      return {
+        ...createdStructures[0],
+        createdStructuresCount: createdStructures.length,
+        createdStructures,
+        generatedInvoicesCount: totalGeneratedInvoicesCount,
+      };
+    }
+
+    const singleClassId = rawClassIds[0] || dto.classId?.trim() || null;
+
     const feeStructure = await this.prisma.feeStructure.create({
       data: {
         schoolId,
         title: dto.title.trim(),
         code: dto.code.trim().toUpperCase(),
-        sessionName: dto.sessionName?.trim() || '2025/2026',
-        termId: dto.termId,
-        termOrSemester: dto.termOrSemester?.trim(),
-        targetScope: dto.targetScope || 'WHOLE_SCHOOL',
-        unitId: dto.unitId,
-        departmentId: dto.departmentId,
-        classId: dto.classId,
-        levelName: dto.levelName?.trim(),
-        paymentAccountId,
+        sessionName: effectiveSessionName,
+        termId: effectiveTermId,
+        termOrSemester: effectiveTermName,
+        targetScope,
+        unitId: dto.unitId?.trim() || null,
+        departmentId: dto.departmentId?.trim() || null,
+        classId: singleClassId,
+        levelName: dto.levelName?.trim() || null,
+        paymentAccountId: paymentAccountId || null,
         dueDate: dto.dueDate ? new Date(dto.dueDate) : undefined,
         isMandatory: dto.isMandatory ?? true,
         allowPartialPayment: dto.allowPartialPayment ?? true,
         minimumPartialKobo: dto.minimumPartialKobo ?? 0,
         totalAmountKobo: totalKobo,
+        isPublished,
+        approvalStatus,
+        approvedById,
+        approvedAt,
+        billingPeriod,
         createdById: actorId,
         feeItems: {
           create: dto.items.map((item, idx) => ({
@@ -431,14 +866,12 @@ export class FinanceService {
           })),
         },
       },
-      include: {
-        feeItems: true,
-        paymentAccount: true,
-      },
+      include: includeRelations,
     });
 
     let generatedInvoicesCount = 0;
-    if (dto.autoGenerateInvoices !== false) {
+    // Only auto-generate invoices if approved (not pending bursary approval)
+    if (isPublished && dto.autoGenerateInvoices !== false) {
       generatedInvoicesCount = await this.generateInvoicesForFeeStructure(
         schoolId,
         feeStructure.id,
@@ -457,14 +890,435 @@ export class FinanceService {
         title: feeStructure.title,
         code: feeStructure.code,
         targetScope: feeStructure.targetScope,
+        classId: feeStructure.classId,
+        termId: feeStructure.termId,
+        billingPeriod,
+        approvalStatus,
         generatedInvoicesCount,
       },
     });
 
     return {
       ...feeStructure,
+      createdStructuresCount: 1,
       generatedInvoicesCount,
     };
+  }
+
+  async updateFeeStructure(
+    schoolId: string,
+    feeStructureId: string,
+    actorId: string,
+    actorRole: string,
+    dto: UpdateFeeStructureDto,
+  ) {
+    const fee = await this.prisma.feeStructure.findFirst({
+      where: { id: feeStructureId, schoolId },
+      include: { feeItems: true },
+    });
+    if (!fee) {
+      throw new NotFoundException('Fee structure not found');
+    }
+
+    // Strict post-approval lock: once School Admin approves & publishes a fee, Bursar cannot modify it
+    if (actorRole === 'SCHOOL_FINANCE' && (fee.approvalStatus === 'APPROVED' || fee.isPublished)) {
+      throw new ForbiddenException(
+        'This fee structure has already been approved and published by the School Admin and cannot be modified by the Bursar.',
+      );
+    }
+
+    const hasNewItems = Array.isArray(dto.items) && dto.items.length > 0;
+    if (hasNewItems) {
+      const existingAllocations = await this.prisma.paymentAllocation.count({
+        where: { feeItem: { feeStructureId } },
+      });
+      if (existingAllocations > 0) {
+        throw new BadRequestException(
+          'Breakdown items cannot be replaced because verified student payments have already been allocated against this fee structure.',
+        );
+      }
+    }
+
+    const newTotalKobo = hasNewItems
+      ? dto.items!.reduce((sum, item) => sum + (Number(item.amountKobo) || 0), 0)
+      : fee.totalAmountKobo;
+
+    const isAdminActor = actorRole === 'SCHOOL_ADMIN' || actorRole === 'SUPER_ADMIN';
+    let nextApprovalStatus = fee.approvalStatus;
+    let nextIsPublished = fee.isPublished;
+    let nextApprovedById = fee.approvedById;
+    let nextApprovedAt = fee.approvedAt;
+    let nextRejectionReason = fee.rejectionReason;
+
+    if (actorRole === 'SCHOOL_FINANCE') {
+      nextApprovalStatus = 'PENDING_APPROVAL';
+      nextIsPublished = false;
+      nextRejectionReason = null;
+    } else if (isAdminActor && dto.approveAndPublish) {
+      nextApprovalStatus = 'APPROVED';
+      nextIsPublished = true;
+      nextApprovedById = actorId;
+      nextApprovedAt = new Date();
+      nextRejectionReason = null;
+    }
+
+    const hasClassIdsField = Array.isArray(dto.classIds);
+    const rawClassIds = hasClassIdsField
+      ? Array.from(new Set(dto.classIds!.map((id) => id?.trim()).filter(Boolean) as string[]))
+      : dto.classId?.trim()
+        ? [dto.classId.trim()]
+        : [];
+
+    const primaryClassId =
+      rawClassIds.length > 0
+        ? fee.classId && rawClassIds.includes(fee.classId)
+          ? fee.classId
+          : rawClassIds[0]
+        : hasClassIdsField || dto.classId !== undefined
+          ? dto.classId?.trim() || null
+          : undefined;
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      if (hasNewItems) {
+        await tx.feeItem.deleteMany({ where: { feeStructureId } });
+        await tx.feeItem.createMany({
+          data: dto.items!.map((item, idx) => ({
+            feeStructureId,
+            name: item.name.trim(),
+            amountKobo: Number(item.amountKobo) || 0,
+            isOptional: item.isOptional ?? false,
+            sortOrder: item.sortOrder ?? idx + 1,
+          })),
+        });
+      }
+
+      const saved = await tx.feeStructure.update({
+        where: { id: feeStructureId },
+        data: {
+          title: dto.title !== undefined ? dto.title.trim() : undefined,
+          code: dto.code !== undefined ? dto.code.trim().toUpperCase() : undefined,
+          sessionName: dto.sessionName !== undefined ? dto.sessionName.trim() : undefined,
+          termId: dto.termId !== undefined ? dto.termId?.trim() || null : undefined,
+          termOrSemester:
+            dto.termOrSemester !== undefined ? dto.termOrSemester?.trim() || null : undefined,
+          targetScope: dto.targetScope !== undefined ? dto.targetScope : undefined,
+          unitId: dto.unitId !== undefined ? dto.unitId?.trim() || null : undefined,
+          departmentId:
+            dto.departmentId !== undefined ? dto.departmentId?.trim() || null : undefined,
+          classId: primaryClassId,
+          levelName: dto.levelName !== undefined ? dto.levelName?.trim() || null : undefined,
+          paymentAccountId:
+            dto.paymentAccountId !== undefined ? dto.paymentAccountId?.trim() || null : undefined,
+          dueDate: dto.dueDate !== undefined ? (dto.dueDate ? new Date(dto.dueDate) : null) : undefined,
+          isMandatory: dto.isMandatory !== undefined ? dto.isMandatory : undefined,
+          allowPartialPayment:
+            dto.allowPartialPayment !== undefined ? dto.allowPartialPayment : undefined,
+          minimumPartialKobo:
+            dto.minimumPartialKobo !== undefined ? dto.minimumPartialKobo : undefined,
+          billingPeriod: dto.billingPeriod !== undefined ? dto.billingPeriod : undefined,
+          totalAmountKobo: newTotalKobo,
+          approvalStatus: nextApprovalStatus,
+          isPublished: nextIsPublished,
+          approvedById: nextApprovedById,
+          approvedAt: nextApprovedAt,
+          rejectionReason: nextRejectionReason,
+        },
+        include: {
+          feeItems: { orderBy: { sortOrder: 'asc' } },
+          paymentAccount: true,
+          unit: { select: { id: true, name: true, code: true } },
+          department: { select: { id: true, name: true, code: true } },
+          class: { select: { id: true, name: true, levelCode: true } },
+          term: { select: { id: true, name: true } },
+          createdBy: { select: { id: true, fullName: true, role: true } },
+          approvedBy: { select: { id: true, fullName: true, role: true } },
+          _count: { select: { invoices: true } },
+        },
+      });
+
+      if (nextIsPublished && nextApprovalStatus === 'APPROVED' && newTotalKobo !== fee.totalAmountKobo) {
+        await tx.studentInvoice.updateMany({
+          where: {
+            feeStructureId,
+            status: 'UNPAID',
+            paidAmountKobo: 0,
+          },
+          data: {
+            totalAmountKobo: newTotalKobo,
+            balanceAmountKobo: newTotalKobo,
+          },
+        });
+      }
+
+      return saved;
+    });
+
+    let generatedInvoicesCount = 0;
+    if (nextIsPublished && nextApprovalStatus === 'APPROVED' && dto.autoGenerateInvoices !== false) {
+      generatedInvoicesCount = await this.generateInvoicesForFeeStructure(
+        schoolId,
+        feeStructureId,
+      );
+    }
+
+    let stretchedClassesCount = 1;
+    const effectiveScope = dto.targetScope || fee.targetScope;
+    if (effectiveScope === 'LEVEL_OR_CLASS' && rawClassIds.length > 1) {
+      const extraClassIds = rawClassIds.filter((id) => id !== updated.classId);
+      if (extraClassIds.length > 0) {
+        const extraClasses = await this.prisma.schoolClass.findMany({
+          where: { schoolId, id: { in: extraClassIds } },
+          orderBy: { name: 'asc' },
+        });
+        const baseTitle = updated.title.replace(/\s*\([^)]+\)\s*$/, '').trim();
+        const baseCode = updated.code;
+
+        for (const cls of extraClasses) {
+          const suffix =
+            cls.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase() || cls.id.slice(0, 4).toUpperCase();
+          const stretched = await this.prisma.feeStructure.create({
+            data: {
+              schoolId,
+              title: `${baseTitle} (${cls.name})`,
+              code: `${baseCode}-${suffix}`,
+              sessionName: updated.sessionName,
+              termId: updated.termId,
+              termOrSemester: updated.termOrSemester,
+              targetScope: 'LEVEL_OR_CLASS',
+              unitId: null,
+              departmentId: null,
+              classId: cls.id,
+              levelName: updated.levelName,
+              paymentAccountId: updated.paymentAccountId,
+              dueDate: updated.dueDate,
+              isMandatory: updated.isMandatory,
+              allowPartialPayment: updated.allowPartialPayment,
+              minimumPartialKobo: updated.minimumPartialKobo,
+              totalAmountKobo: newTotalKobo,
+              isPublished: nextIsPublished,
+              approvalStatus: nextApprovalStatus,
+              approvedById: nextApprovedById,
+              approvedAt: nextApprovedAt,
+              billingPeriod: updated.billingPeriod,
+              createdById: fee.createdById || actorId,
+              feeItems: {
+                create: updated.feeItems.map((item, idx) => ({
+                  name: item.name,
+                  amountKobo: item.amountKobo,
+                  isOptional: item.isOptional,
+                  sortOrder: item.sortOrder ?? idx + 1,
+                })),
+              },
+            },
+          });
+
+          if (
+            nextIsPublished &&
+            nextApprovalStatus === 'APPROVED' &&
+            dto.autoGenerateInvoices !== false
+          ) {
+            generatedInvoicesCount += await this.generateInvoicesForFeeStructure(
+              schoolId,
+              stretched.id,
+            );
+          }
+
+          await this.logFinancialAudit({
+            schoolId,
+            actorId,
+            actorRole,
+            action: 'FEE_STRUCTURE_CREATED',
+            entityType: 'FeeStructure',
+            entityId: stretched.id,
+            amountKobo: newTotalKobo,
+            diffJson: {
+              stretchedFromId: fee.id,
+              classId: cls.id,
+              approvalStatus: nextApprovalStatus,
+            },
+          });
+        }
+        stretchedClassesCount = extraClasses.length + 1;
+      }
+    }
+
+    const auditAction =
+      isAdminActor && dto.approveAndPublish
+        ? 'FEE_STRUCTURE_MODIFIED_AND_APPROVED'
+        : 'FEE_STRUCTURE_UPDATED';
+
+    await this.logFinancialAudit({
+      schoolId,
+      actorId,
+      actorRole,
+      action: auditAction,
+      entityType: 'FeeStructure',
+      entityId: fee.id,
+      amountKobo: newTotalKobo,
+      diffJson: {
+        previousTotalKobo: fee.totalAmountKobo,
+        newTotalKobo,
+        previousStatus: fee.approvalStatus,
+        nextApprovalStatus,
+        stretchedClassesCount,
+        generatedInvoicesCount,
+      },
+    });
+
+    if (isAdminActor && dto.approveAndPublish && fee.createdById && fee.createdById !== actorId) {
+      try {
+        void this.notifications.dispatchNotification({
+          userId: fee.createdById,
+          schoolId,
+          title: 'Fee Structure Reviewed & Approved! 📋✅',
+          body: `The School Admin reviewed and approved "${updated.title}". It is now live and locked for Bursary edits.`,
+          category: 'FINANCE',
+          deepLink: '/schoolFinance',
+          dataJson: { feeStructureId: updated.id },
+        });
+      } catch (err) {}
+    }
+
+    return {
+      ...updated,
+      stretchedClassesCount,
+      generatedInvoicesCount,
+    };
+  }
+
+  async approveFeeStructure(
+    schoolId: string,
+    feeStructureId: string,
+    actorId: string,
+    actorRole: string,
+    dto?: ApproveFeeStructureDto,
+  ) {
+    const fee = await this.prisma.feeStructure.findFirst({
+      where: { id: feeStructureId, schoolId },
+    });
+    if (!fee) throw new NotFoundException('Fee structure not found');
+
+    const updated = await this.prisma.feeStructure.update({
+      where: { id: feeStructureId },
+      data: {
+        approvalStatus: 'APPROVED',
+        isPublished: true,
+        approvedById: actorId,
+        approvedAt: new Date(),
+        rejectionReason: null,
+      },
+      include: {
+        feeItems: true,
+        paymentAccount: true,
+        createdBy: { select: { id: true, fullName: true, role: true } },
+        approvedBy: { select: { id: true, fullName: true, role: true } },
+      },
+    });
+
+    let generatedInvoicesCount = 0;
+    if (dto?.autoGenerateInvoices !== false) {
+      generatedInvoicesCount = await this.generateInvoicesForFeeStructure(
+        schoolId,
+        feeStructureId,
+      );
+    }
+
+    await this.logFinancialAudit({
+      schoolId,
+      actorId,
+      actorRole,
+      action: 'FEE_STRUCTURE_APPROVED',
+      entityType: 'FeeStructure',
+      entityId: fee.id,
+      amountKobo: fee.totalAmountKobo,
+      diffJson: {
+        title: fee.title,
+        approvedBy: actorId,
+        generatedInvoicesCount,
+      },
+    });
+
+    this.financeGateway?.emitFinanceUpdate({
+      schoolId,
+      eventType: 'FEE_APPROVED',
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (fee.createdById) {
+      try {
+        void this.notifications.dispatchNotification({
+          userId: fee.createdById,
+          schoolId,
+          title: 'Fee Structure Approved! 📋✅',
+          body: `Your fee structure "${fee.title}" has been approved by the School Administration and is now live for students.`,
+          category: 'FINANCE',
+          deepLink: '/schoolFinance',
+          dataJson: { feeStructureId: fee.id },
+        });
+      } catch (err) {}
+    }
+
+    return {
+      ...updated,
+      generatedInvoicesCount,
+    };
+  }
+
+  async rejectFeeStructure(
+    schoolId: string,
+    feeStructureId: string,
+    actorId: string,
+    actorRole: string,
+    dto: RejectFeeStructureDto,
+  ) {
+    const fee = await this.prisma.feeStructure.findFirst({
+      where: { id: feeStructureId, schoolId },
+    });
+    if (!fee) throw new NotFoundException('Fee structure not found');
+
+    const updated = await this.prisma.feeStructure.update({
+      where: { id: feeStructureId },
+      data: {
+        approvalStatus: 'REJECTED',
+        isPublished: false,
+        rejectionReason: dto.reason.trim(),
+      },
+      include: {
+        feeItems: true,
+        paymentAccount: true,
+        createdBy: { select: { id: true, fullName: true, role: true } },
+        approvedBy: { select: { id: true, fullName: true, role: true } },
+      },
+    });
+
+    await this.logFinancialAudit({
+      schoolId,
+      actorId,
+      actorRole,
+      action: 'FEE_STRUCTURE_REJECTED',
+      entityType: 'FeeStructure',
+      entityId: fee.id,
+      diffJson: {
+        title: fee.title,
+        reason: dto.reason.trim(),
+      },
+    });
+
+    if (fee.createdById) {
+      try {
+        void this.notifications.dispatchNotification({
+          userId: fee.createdById,
+          schoolId,
+          title: 'Fee Structure Requires Changes ⚠️',
+          body: `Your fee structure "${fee.title}" was not approved by School Administration. Reason: "${dto.reason.trim()}". Please update and resubmit.`,
+          category: 'FINANCE',
+          deepLink: '/schoolFinance',
+          dataJson: { feeStructureId: fee.id },
+        });
+      } catch (err) {}
+    }
+
+    return updated;
   }
 
   // ============================================================================
@@ -475,20 +1329,47 @@ export class FinanceService {
     const fee = await this.prisma.feeStructure.findUnique({
       where: { id: feeStructureId },
       include: {
-        school: { select: { id: true, schoolCode: true, name: true } },
+        school: { select: { id: true, schoolCode: true, name: true, institutionType: true } },
+        class: { select: { id: true, name: true, levelCode: true } },
       },
     });
     if (!fee || fee.schoolId !== schoolId) {
       throw new NotFoundException('Fee structure not found');
     }
 
-    // Query matching enrolled students based on targetScope
-    let studentsQuery: any = {
+    // Query matching enrolled students based on targetScope and classId
+    const studentsQuery: any = {
       schoolId,
       role: 'STUDENT',
     };
 
-    if (fee.targetScope === 'WHOLE_SCHOOL') {
+    if (fee.classId) {
+      // Match all class assignment paths (direct User.classId, StudentProfile.classId, ClassEnrollment, class name)
+      const classOrConditions: any[] = [
+        { classId: fee.classId },
+        { studentProfile: { classId: fee.classId } },
+        { classEnrollments: { some: { classId: fee.classId } } },
+      ];
+      if (fee.class?.name) {
+        classOrConditions.push(
+          { schoolClass: { name: { equals: fee.class.name, mode: 'insensitive' } } },
+          { studentProfile: { schoolClass: { name: { equals: fee.class.name, mode: 'insensitive' } } } },
+        );
+        const instUpper = String(fee.school?.institutionType || '').toUpperCase();
+        const isTertiary = ['UNIVERSITY', 'POLYTECHNIC', 'COLLEGE_OF_EDUCATION', 'TERTIARY'].includes(
+          instUpper,
+        );
+        if (!isTertiary) {
+          classOrConditions.push({
+            studentProfile: {
+              classId: null,
+              level: { equals: fee.class.name, mode: 'insensitive' },
+            },
+          });
+        }
+      }
+      studentsQuery.OR = classOrConditions;
+    } else if (fee.targetScope === 'WHOLE_SCHOOL') {
       if (fee.levelName) {
         studentsQuery.studentProfile = { level: fee.levelName };
       }
@@ -502,12 +1383,12 @@ export class FinanceService {
         departmentId: fee.departmentId,
         ...(fee.levelName ? { level: fee.levelName } : {}),
       };
-    } else if (fee.targetScope === 'LEVEL_OR_CLASS') {
-      if (fee.classId) {
-        studentsQuery.studentProfile = { classId: fee.classId };
-      } else if (fee.levelName) {
-        studentsQuery.studentProfile = { level: fee.levelName };
-      }
+    } else if (fee.targetScope === 'LEVEL_OR_CLASS' && fee.levelName) {
+      studentsQuery.OR = [
+        { studentProfile: { level: fee.levelName } },
+        { schoolClass: { name: { equals: fee.levelName, mode: 'insensitive' } } },
+        { studentProfile: { schoolClass: { name: { equals: fee.levelName, mode: 'insensitive' } } } },
+      ];
     }
 
     const students = await this.prisma.user.findMany({
@@ -563,7 +1444,255 @@ export class FinanceService {
   // 4. STUDENT INVOICES & FINANCIAL CLEARANCE STATUS
   // ============================================================================
 
+  /**
+   * Reconciles a student's invoices against all currently approved & published fee structures
+   * in their institution so students created/moved after fee publication automatically receive
+   * matching invoices and shed untouched unpaid invoices from old classes.
+   */
+  private async syncStudentInvoicesForActiveFees(schoolId: string, studentId: string): Promise<void> {
+    const syncKey = `${schoolId}:${studentId}`;
+    const existingSync = this.pendingInvoiceSyncs.get(syncKey);
+    if (existingSync) {
+      return existingSync;
+    }
+
+    const syncPromise = this.executeStudentInvoiceSync(schoolId, studentId).finally(() => {
+      this.pendingInvoiceSyncs.delete(syncKey);
+    });
+    this.pendingInvoiceSyncs.set(syncKey, syncPromise);
+    return syncPromise;
+  }
+
+  private async executeStudentInvoiceSync(schoolId: string, studentId: string): Promise<void> {
+    const student = await this.prisma.user.findFirst({
+      where: { id: studentId, schoolId, role: 'STUDENT' },
+      include: {
+        school: {
+          select: {
+            id: true,
+            schoolCode: true,
+            institutionType: true,
+          },
+        },
+        schoolClass: true,
+        studentProfile: {
+          include: {
+            schoolClass: true,
+            department: true,
+          },
+        },
+        classEnrollments: {
+          include: { schoolClass: true },
+        },
+      },
+    });
+    if (!student) return;
+
+    const instUpper = String(student.school?.institutionType || '').toUpperCase();
+    const isTertiary = ['UNIVERSITY', 'POLYTECHNIC', 'COLLEGE_OF_EDUCATION', 'TERTIARY'].includes(
+      instUpper,
+    );
+
+    const effectiveClass =
+      student.studentProfile?.schoolClass ||
+      student.schoolClass ||
+      student.classEnrollments?.[0]?.schoolClass ||
+      null;
+    const effectiveClassId =
+      effectiveClass?.id ||
+      student.studentProfile?.classId ||
+      student.classId ||
+      null;
+    const effectiveClassName = effectiveClass?.name || null;
+    const effectiveDeptId =
+      student.studentProfile?.departmentId || effectiveClass?.departmentId || null;
+    const effectiveUnitId = student.studentProfile?.department?.unitId || null;
+
+    // Auto-heal stale level / classId links when a student has a concrete SchoolClass assigned
+    if (
+      !isTertiary &&
+      effectiveClassName &&
+      student.studentProfile &&
+      (student.studentProfile.level !== effectiveClassName ||
+        student.studentProfile.classId !== effectiveClassId)
+    ) {
+      await this.prisma.studentProfile.update({
+        where: { id: student.studentProfile.id },
+        data: {
+          classId: effectiveClassId,
+          level: effectiveClassName,
+        },
+      });
+      student.studentProfile.level = effectiveClassName;
+      student.studentProfile.classId = effectiveClassId;
+    }
+
+    if (effectiveClassId && student.classId !== effectiveClassId) {
+      await this.prisma.user.update({
+        where: { id: student.id },
+        data: { classId: effectiveClassId },
+      });
+      student.classId = effectiveClassId;
+    }
+
+    const norm = (val?: string | null) => String(val || '').trim().toLowerCase();
+    const studentLevelTokens = new Set(
+      [
+        norm(effectiveClassName),
+        norm(effectiveClass?.levelCode),
+        norm(student.studentProfile?.level),
+      ].filter(Boolean),
+    );
+
+    const matchesLevel = (levelName?: string | null): boolean => {
+      const target = norm(levelName);
+      if (!target) return true;
+      if (studentLevelTokens.has(target)) return true;
+      if (effectiveClassName) {
+        const clsNorm = norm(effectiveClassName);
+        if (
+          clsNorm === target ||
+          clsNorm.startsWith(`${target} `) ||
+          (clsNorm.startsWith(target) && /^[a-z]$/i.test(clsNorm.slice(target.length)))
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const doesFeeMatchStudent = (fee: {
+      classId?: string | null;
+      class?: { name?: string | null } | null;
+      targetScope: string;
+      unitId?: string | null;
+      departmentId?: string | null;
+      levelName?: string | null;
+    }): boolean => {
+      if (fee.classId) {
+        if (effectiveClassId && fee.classId === effectiveClassId) return true;
+        if (
+          fee.class?.name &&
+          effectiveClassName &&
+          norm(fee.class.name) === norm(effectiveClassName)
+        ) {
+          return true;
+        }
+        return false;
+      }
+      if (fee.targetScope === 'WHOLE_SCHOOL') {
+        return fee.levelName ? matchesLevel(fee.levelName) : true;
+      }
+      if (fee.targetScope === 'FACULTY') {
+        return (
+          Boolean(fee.unitId && effectiveUnitId && fee.unitId === effectiveUnitId) &&
+          (!fee.levelName || matchesLevel(fee.levelName))
+        );
+      }
+      if (fee.targetScope === 'DEPARTMENT') {
+        return (
+          Boolean(fee.departmentId && effectiveDeptId && fee.departmentId === effectiveDeptId) &&
+          (!fee.levelName || matchesLevel(fee.levelName))
+        );
+      }
+      if (fee.targetScope === 'LEVEL_OR_CLASS') {
+        return Boolean(fee.levelName && matchesLevel(fee.levelName));
+      }
+      return false;
+    };
+
+    const existingInvoices = await this.prisma.studentInvoice.findMany({
+      where: { schoolId, studentId },
+      include: {
+        feeStructure: { include: { class: true } },
+        payments: { select: { id: true } },
+        evidences: { select: { id: true } },
+      },
+    });
+
+    const existingFeeIds = new Set<string>();
+    const staleInvoiceIds: string[] = [];
+
+    for (const inv of existingInvoices) {
+      const isUntouchedUnpaid =
+        inv.paidAmountKobo === 0 &&
+        inv.payments.length === 0 &&
+        inv.evidences.length === 0;
+      const isPublishedApproved =
+        inv.feeStructure.isPublished && inv.feeStructure.approvalStatus === 'APPROVED';
+
+      if (
+        isUntouchedUnpaid &&
+        (!isPublishedApproved ||
+          (inv.feeStructure.classId &&
+            effectiveClassId &&
+            inv.feeStructure.classId !== effectiveClassId))
+      ) {
+        staleInvoiceIds.push(inv.id);
+      } else {
+        existingFeeIds.add(inv.feeStructureId);
+      }
+    }
+
+    if (staleInvoiceIds.length > 0) {
+      await this.prisma.studentInvoice.deleteMany({
+        where: { id: { in: staleInvoiceIds }, schoolId, studentId },
+      });
+    }
+
+    const publishedFees = await this.prisma.feeStructure.findMany({
+      where: {
+        schoolId,
+        isPublished: true,
+        approvalStatus: 'APPROVED',
+      },
+      include: { class: true },
+    });
+
+    const schoolPrefix = (student.school?.schoolCode || 'SSP').toUpperCase();
+    const yearPrefix = new Date().getFullYear();
+    const studentTag = student.id.replace(/[^a-zA-Z0-9]/g, '').slice(0, 4).toUpperCase();
+    let seq = existingInvoices.length + 1;
+
+    for (const fee of publishedFees) {
+      if (existingFeeIds.has(fee.id)) continue;
+      if (!doesFeeMatchStudent(fee)) continue;
+
+      const duplicateCheck = await this.prisma.studentInvoice.findFirst({
+        where: { schoolId, studentId, feeStructureId: fee.id },
+        select: { id: true },
+      });
+      if (duplicateCheck) continue;
+
+      const randomSuffix = Math.floor(1000 + Math.random() * 9000);
+      const invoiceNumber = `INV-${schoolPrefix}-${yearPrefix}-${studentTag}${String(seq).padStart(2, '0')}-${randomSuffix}`;
+      const qrClearanceToken = `CLR-${schoolPrefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+      seq++;
+
+      try {
+        await this.prisma.studentInvoice.create({
+          data: {
+            schoolId,
+            studentId,
+            feeStructureId: fee.id,
+            invoiceNumber,
+            totalAmountKobo: fee.totalAmountKobo,
+            paidAmountKobo: 0,
+            balanceAmountKobo: fee.totalAmountKobo,
+            status: 'UNPAID',
+            dueDate: fee.dueDate,
+            qrClearanceToken,
+          },
+        });
+      } catch (err: any) {
+        if (err?.code !== 'P2002') throw err;
+      }
+    }
+  }
+
   async getStudentInvoices(schoolId: string, studentId: string, status?: string) {
+    await this.syncStudentInvoicesForActiveFees(schoolId, studentId);
+
     return this.prisma.studentInvoice.findMany({
       where: {
         schoolId,
@@ -594,9 +1723,13 @@ export class FinanceService {
   }
 
   async getStudentClearanceStatus(schoolId: string, studentId: string) {
+    await this.syncStudentInvoicesForActiveFees(schoolId, studentId);
+
     const student = await this.prisma.user.findUnique({
       where: { id: studentId },
       include: {
+        school: { select: { institutionType: true } },
+        schoolClass: true,
         studentProfile: {
           include: {
             department: { include: { unit: true } },
@@ -626,6 +1759,20 @@ export class FinanceService {
       mandatoryInvoices.length > 0 &&
       mandatoryInvoices.every((inv) => inv.status === 'PAID' || inv.balanceAmountKobo <= 0);
 
+    const instUpper = String(student.school?.institutionType || '').toUpperCase();
+    const isTertiary = ['UNIVERSITY', 'POLYTECHNIC', 'COLLEGE_OF_EDUCATION', 'TERTIARY'].includes(
+      instUpper,
+    );
+    const resolvedClassOrLevel = isTertiary
+      ? student.studentProfile?.level ||
+        student.studentProfile?.schoolClass?.name ||
+        student.schoolClass?.name ||
+        'Current Level'
+      : student.studentProfile?.schoolClass?.name ||
+        student.schoolClass?.name ||
+        student.studentProfile?.level ||
+        'Current Class';
+
     const matricNo = student.studentProfile?.matricOrAdmissionNo || student.loginId || '';
     const primaryClearanceToken =
       invoices.find((inv) => inv.status === 'PAID')?.qrClearanceToken ||
@@ -639,11 +1786,12 @@ export class FinanceService {
         matricOrAdmissionNo: matricNo,
         departmentName: student.studentProfile?.department?.name || 'General',
         facultyName: student.studentProfile?.department?.unit?.name || 'General',
-        level: student.studentProfile?.level || student.studentProfile?.schoolClass?.name || 'Current Level',
+        level: resolvedClassOrLevel,
       },
       isCleared,
       clearanceStatus: isCleared ? 'CLEARED' : 'OUTSTANDING_FEES',
       primaryClearanceToken,
+      platformFeeKobo: this.getPlatformFeeKobo(),
       totalInvoicedKobo,
       totalPaidKobo,
       totalOutstandingKobo,
@@ -666,6 +1814,28 @@ export class FinanceService {
   // ============================================================================
   // 5. 4 PAYMENT CHANNELS: PAYSTACK, CASH, POS, & BANK TRANSFER PROOF
   // ============================================================================
+
+  private toPaystackValidEmail(rawEmail?: string | null, fallbackId?: string | null): string {
+    const clean = String(rawEmail || '').trim().toLowerCase();
+    const normalized = clean.endsWith('.spark')
+      ? clean.replace(/\.spark$/, '.studentspark.ng')
+      : clean;
+
+    const isValidPublicEmail =
+      /^[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z]{2,10}$/i.test(normalized) &&
+      !/\.(spark|local|test|invalid)$/i.test(normalized);
+
+    if (isValidPublicEmail) {
+      return normalized;
+    }
+
+    const safeLocal =
+      String(fallbackId || 'student')
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]/g, '')
+        .slice(0, 32) || 'student';
+    return `${safeLocal}@studentspark.ng`;
+  }
 
   /**
    * Channel 1: Online Paystack Init
@@ -694,18 +1864,98 @@ export class FinanceService {
       : invoice.balanceAmountKobo;
 
     const paystackReference = `SSP-FEE-${invoice.id.slice(0, 8)}-${Date.now()}`;
-    const subaccountCode = invoice.feeStructure.paymentAccount?.paystackSubaccountCode || null;
+    let subaccountCode = invoice.feeStructure.paymentAccount?.paystackSubaccountCode || null;
+
+    // Just-in-time auto-provision if account lacks a subaccount code but has valid bank details
+    const pAcc = invoice.feeStructure.paymentAccount;
+    if (!subaccountCode && pAcc?.bankCode && pAcc?.accountNumber) {
+      const autoCode = await this.autoProvisionPaystackSubaccount(
+        pAcc.accountName,
+        pAcc.bankCode,
+        pAcc.accountNumber,
+        `${invoice.schoolId} Tuition Collection`,
+      );
+      if (autoCode) {
+        subaccountCode = autoCode;
+        await this.prisma.paymentAccount.update({
+          where: { id: pAcc.id },
+          data: { paystackSubaccountCode: autoCode },
+        });
+      }
+    }
+
+    // Dev/Test & Production subaccount safety:
+    // If subaccount is passed, verify it is registered on Paystack to prevent "Invalid Subaccount" crash
+    if (subaccountCode) {
+      const cleanSub = subaccountCode.trim();
+      if (
+        cleanSub.includes('placeholder') ||
+        cleanSub.includes('dummy') ||
+        cleanSub.includes('futo_') ||
+        cleanSub.includes('sample') ||
+        !cleanSub.startsWith('ACCT_')
+      ) {
+        this.logger.warn(
+          `Omitting mock subaccount "${cleanSub}" for payment ${paystackReference} to prevent Paystack crash.`,
+        );
+        subaccountCode = null;
+      } else {
+        const secret = process.env.PAYSTACK_SECRET_KEY;
+        if (secret && !secret.includes('placeholder')) {
+          try {
+            const checkRes = await fetch(
+              `https://api.paystack.co/subaccount/${encodeURIComponent(cleanSub)}`,
+              {
+                headers: { Authorization: `Bearer ${secret}` },
+                signal: AbortSignal.timeout(6000),
+              },
+            );
+            const checkData = (await checkRes.json()) as any;
+            if (!checkData.status || !checkData.data?.active) {
+              this.logger.warn(
+                `Paystack subaccount "${cleanSub}" not found or inactive (${checkData.message || 'Inactive'}). Bypassing split to allow seamless checkout.`,
+              );
+              subaccountCode = null;
+            }
+          } catch (err: any) {
+            this.logger.warn(`Could not verify subaccount "${cleanSub}": ${err.message}`);
+            if (secret.startsWith('sk_test_')) {
+              subaccountCode = null;
+            }
+          }
+        }
+      }
+    }
 
     const studentMatric = invoice.student.studentProfile?.matricOrAdmissionNo || invoice.student.loginId;
+    const platformFeeKobo = this.getPlatformFeeKobo();
+    const totalChargeKobo = payAmountKobo + platformFeeKobo;
 
     return {
       paystackReference,
-      amountKobo: payAmountKobo,
-      email: invoice.student.email || `${studentMatric || 'student'}@studentspark.ng`,
+      amountKobo: payAmountKobo, // school-fee portion credited to the invoice
+      platformFeeKobo, // Student Spark convenience fee (on top)
+      totalChargeKobo, // amount sent to Paystack (Paystack may add its own fee if "pass fees to customer" is on)
+      email: this.toPaystackValidEmail(invoice.student.email, studentMatric || invoice.student.id),
       invoiceNumber: invoice.invoiceNumber,
       title: invoice.feeStructure.title,
       publicKey: process.env.PAYSTACK_PUBLIC_KEY || 'pk_test_sample_key',
       subaccountCode,
+      // Dynamic flat split: school subaccount gets exactly the fee; main account keeps the rest
+      // and bears Paystack's processing charge (covered by the customer when fees are passed on).
+      split: subaccountCode
+        ? {
+            type: 'flat' as const,
+            bearer_type: 'account' as const,
+            subaccounts: [{ subaccount: subaccountCode, share: String(payAmountKobo) }],
+          }
+        : null,
+      metadata: {
+        invoiceId: invoice.id,
+        schoolId: invoice.schoolId,
+        principalKobo: payAmountKobo,
+        platformFeeKobo,
+      },
     };
   }
 
@@ -729,9 +1979,16 @@ export class FinanceService {
     if (!invoice || invoice.schoolId !== schoolId) {
       throw new NotFoundException('Invoice not found');
     }
+    if (invoice.studentId !== studentId) {
+      throw new ForbiddenException('You cannot verify payment for another student invoice.');
+    }
 
     const existingPayment = await this.prisma.financePayment.findFirst({
-      where: { paystackReference: dto.paystackReference },
+      where: {
+        paystackReference: dto.paystackReference,
+        schoolId,
+        studentId,
+      },
       include: { receipt: true },
     });
     if (existingPayment) {
@@ -745,29 +2002,38 @@ export class FinanceService {
     const paystackSecret = process.env.PAYSTACK_SECRET_KEY;
     let verifiedAmountKobo = invoice.balanceAmountKobo;
     if (paystackSecret && !paystackSecret.includes('placeholder') && !paystackSecret.includes('sample')) {
+      let data: any = null;
       try {
         const res = await fetch(
           `https://api.paystack.co/transaction/verify/${encodeURIComponent(dto.paystackReference)}`,
           {
             headers: { Authorization: `Bearer ${paystackSecret}` },
+            signal: AbortSignal.timeout(10000),
           },
         );
-        const data = (await res.json()) as any;
-        if (data.status && data.data?.status === 'success') {
-          verifiedAmountKobo = Number(data.data.amount) || verifiedAmountKobo;
-        } else {
-          throw new BadRequestException('Paystack verification failed: Transaction not successful.');
-        }
+        data = (await res.json()) as any;
       } catch (err: any) {
-        this.logger.warn(`Live Paystack verify check: ${String(err.message)}`);
+        this.logger.warn(`Live Paystack verify network check: ${String(err?.message || err)}`);
+      }
+
+      if (data) {
+        if (data.status && data.data?.status === 'success') {
+          verifiedAmountKobo = this.extractSchoolPrincipalKobo(data.data) || verifiedAmountKobo;
+        } else {
+          throw new BadRequestException(
+            data.message || 'Paystack verification failed: Transaction not successful.',
+          );
+        }
       }
     }
+
+    const amountToCreditKobo = Math.min(verifiedAmountKobo, invoice.balanceAmountKobo);
 
     return this.applyPaymentSuccess({
       schoolId,
       studentId,
       invoice,
-      amountKobo: verifiedAmountKobo,
+      amountKobo: amountToCreditKobo,
       channel: 'PAYSTACK',
       reference: `PAY-${dto.paystackReference}`,
       paystackReference: dto.paystackReference,
@@ -786,7 +2052,7 @@ export class FinanceService {
 
     const data = event.data;
     const reference = data?.reference;
-    const amountKobo = Number(data?.amount);
+    const amountKobo = this.extractSchoolPrincipalKobo(data);
 
     if (!reference) {
       return { status: 'error', message: 'No reference provided in webhook event' };
@@ -832,7 +2098,7 @@ export class FinanceService {
         schoolId: invoice.schoolId,
         studentId: invoice.studentId,
         invoice,
-        amountKobo: amountKobo || invoice.balanceAmountKobo,
+        amountKobo: Math.min(amountKobo || invoice.balanceAmountKobo, invoice.balanceAmountKobo),
         channel: 'PAYSTACK',
         reference: `PAY-${reference}`,
         paystackReference: reference,
@@ -909,6 +2175,9 @@ export class FinanceService {
     if (!invoice || invoice.schoolId !== schoolId) {
       throw new NotFoundException('Invoice not found');
     }
+    if (invoice.studentId !== studentId) {
+      throw new ForbiddenException('You cannot submit transfer evidence for another student invoice.');
+    }
 
     let proofImageUrl = dto.proofImageUrl;
     if (!proofImageUrl && dto.proofBase64) {
@@ -967,9 +2236,12 @@ export class FinanceService {
     for (const staff of financeStaff) {
       void this.notifications.dispatchNotification({
         userId: staff.id,
+        schoolId,
         title: '🏦 New Bank Transfer Proof Submitted',
         body: `${evidence.student.fullName} submitted ₦${(evidence.transferAmountKobo / 100).toLocaleString()} transfer proof for ${evidence.invoice.feeStructure.title}.`,
-        category: 'COMMUNITY',
+        category: 'FINANCE',
+        deepLink: '/schoolFinance',
+        dataJson: { evidenceId: evidence.id, invoiceId: evidence.invoiceId },
       });
     }
 
@@ -1063,9 +2335,12 @@ export class FinanceService {
 
       void this.notifications.dispatchNotification({
         userId: evidence.studentId,
+        schoolId,
         title: '⚠️ Transfer Proof Rejected',
         body: `Your payment proof for ${evidence.invoice.feeStructure.title} was declined: ${dto.reviewNotes || 'Invalid teller or mismatch'}. Please contact Bursary.`,
-        category: 'COMMUNITY',
+        category: 'FINANCE',
+        deepLink: '/studentFees',
+        dataJson: { evidenceId: evidence.id, invoiceId: evidence.invoiceId },
       });
 
       return { evidence: updated, status: 'REJECTED' };
@@ -1109,9 +2384,12 @@ export class FinanceService {
 
     void this.notifications.dispatchNotification({
       userId: evidence.studentId,
+      schoolId,
       title: '🎉 Payment Approved & Receipt Issued!',
       body: `Your ₦${(evidence.transferAmountKobo / 100).toLocaleString()} bank transfer for ${evidence.invoice.feeStructure.title} has been confirmed. Tap to download your Digital Receipt.`,
-      category: 'COMMUNITY',
+      category: 'FINANCE',
+      deepLink: '/studentFees',
+      dataJson: { paymentId: result.payment.id, receiptNumber: result.receipt.receiptNumber },
     });
 
     return {
@@ -1577,6 +2855,16 @@ export class FinanceService {
       },
     });
 
+    this.financeGateway?.emitFinanceUpdate({
+      schoolId,
+      eventType: 'PAYMENT_RECORDED',
+      invoiceId: invoice.id,
+      studentId,
+      receiptNumber,
+      amountKobo,
+      updatedAt: new Date().toISOString(),
+    });
+
     return {
       payment,
       receipt,
@@ -1617,5 +2905,525 @@ export class FinanceService {
     } catch (err: any) {
       this.logger.warn(`Failed to create financial audit log: ${String(err)}`);
     }
+  }
+
+  // ============================================================================
+  // 6. INSTITUTION-WIDE STUDENT INVOICES & TRANSACTION RECEIPTS
+  // ============================================================================
+
+  private buildDateRange(fromStr?: string, toStr?: string): { gte?: Date; lte?: Date } | null {
+    const cleanFrom = fromStr?.trim();
+    const cleanTo = toStr?.trim();
+    if (!cleanFrom && !cleanTo) return null;
+
+    const range: { gte?: Date; lte?: Date } = {};
+    if (cleanFrom) {
+      const start = new Date(`${cleanFrom}T00:00:00.000Z`);
+      if (!Number.isNaN(start.getTime())) range.gte = start;
+    }
+    if (cleanTo) {
+      const end = new Date(`${cleanTo}T23:59:59.999Z`);
+      if (!Number.isNaN(end.getTime())) range.lte = end;
+    }
+    if (!range.gte && !range.lte) return null;
+    return range;
+  }
+
+  private buildStudentSearchOr(search?: string): any[] | null {
+    const q = search?.trim();
+    if (!q) return null;
+    return [
+      { student: { fullName: { contains: q, mode: 'insensitive' } } },
+      { student: { loginId: { contains: q, mode: 'insensitive' } } },
+      { student: { studentCode: { contains: q, mode: 'insensitive' } } },
+      {
+        student: {
+          studentProfile: {
+            matricOrAdmissionNo: { contains: q, mode: 'insensitive' },
+          },
+        },
+      },
+    ];
+  }
+
+  async getSchoolStudentInvoices(
+    schoolId: string,
+    query?: {
+      status?: string;
+      feeStructureId?: string;
+      classId?: string;
+      paidDateFrom?: string;
+      paidDateTo?: string;
+      search?: string;
+      limit?: number;
+      page?: number;
+    },
+  ) {
+    const take = query?.limit ? Math.min(Number(query.limit), 200) : 50;
+    const skip = query?.page ? (Number(query.page) - 1) * take : 0;
+
+    const andConditions: any[] = [];
+    const normalizedStatus = query?.status?.trim().toUpperCase();
+    if (normalizedStatus === 'PAID') {
+      andConditions.push({
+        OR: [{ status: 'PAID' }, { balanceAmountKobo: { lte: 0 } }],
+      });
+    } else if (
+      normalizedStatus === 'HALF_PAID' ||
+      normalizedStatus === 'PARTIALLY_PAID'
+    ) {
+      andConditions.push({
+        paidAmountKobo: { gt: 0 },
+        balanceAmountKobo: { gt: 0 },
+      });
+    } else if (normalizedStatus === 'UNPAID') {
+      andConditions.push({
+        paidAmountKobo: 0,
+        balanceAmountKobo: { gt: 0 },
+      });
+    } else if (normalizedStatus === 'OUTSTANDING') {
+      andConditions.push({
+        balanceAmountKobo: { gt: 0 },
+      });
+    } else if (normalizedStatus && normalizedStatus !== 'ALL') {
+      andConditions.push({ status: normalizedStatus });
+    }
+
+    if (query?.feeStructureId) {
+      andConditions.push({ feeStructureId: query.feeStructureId });
+    }
+
+    if (query?.classId?.trim()) {
+      const cid = query.classId.trim();
+      andConditions.push({
+        OR: [
+          { student: { classId: cid } },
+          { student: { studentProfile: { classId: cid } } },
+        ],
+      });
+    }
+
+    const paidDateRange = this.buildDateRange(query?.paidDateFrom, query?.paidDateTo);
+    if (paidDateRange) {
+      andConditions.push({
+        payments: {
+          some: {
+            status: 'VERIFIED',
+            paidAt: paidDateRange,
+          },
+        },
+      });
+    }
+
+    const studentSearchOr = this.buildStudentSearchOr(query?.search);
+    if (studentSearchOr) {
+      andConditions.push({
+        OR: [
+          { invoiceNumber: { contains: query!.search!.trim(), mode: 'insensitive' } },
+          { qrClearanceToken: { contains: query!.search!.trim(), mode: 'insensitive' } },
+          ...studentSearchOr,
+        ],
+      });
+    }
+
+    const where: any = {
+      schoolId,
+      ...(andConditions.length > 0 ? { AND: andConditions } : {}),
+    };
+
+    const [total, invoices] = await Promise.all([
+      this.prisma.studentInvoice.count({ where }),
+      this.prisma.studentInvoice.findMany({
+        where,
+        take,
+        skip,
+        include: {
+          student: {
+            select: {
+              id: true,
+              fullName: true,
+              loginId: true,
+              studentCode: true,
+              email: true,
+              avatarUrl: true,
+              classId: true,
+              schoolClass: { select: { id: true, name: true } },
+              studentProfile: {
+                select: {
+                  id: true,
+                  matricOrAdmissionNo: true,
+                  level: true,
+                  classId: true,
+                  department: { select: { id: true, name: true, code: true } },
+                  schoolClass: { select: { id: true, name: true } },
+                },
+              },
+            },
+          },
+          feeStructure: {
+            select: {
+              id: true,
+              title: true,
+              code: true,
+              totalAmountKobo: true,
+              billingPeriod: true,
+              sessionName: true,
+              termOrSemester: true,
+              classId: true,
+            },
+          },
+          payments: {
+            where: { status: 'VERIFIED' },
+            orderBy: { paidAt: 'desc' },
+            select: {
+              id: true,
+              amountKobo: true,
+              channel: true,
+              reference: true,
+              paystackReference: true,
+              paidAt: true,
+              createdAt: true,
+            },
+          },
+        },
+        orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
+      }),
+    ]);
+
+    return {
+      total,
+      page: query?.page || 1,
+      limit: take,
+      invoices,
+    };
+  }
+
+  async getSchoolTransactionReceipts(
+    schoolId: string,
+    query?: {
+      channel?: string;
+      classId?: string;
+      paidDateFrom?: string;
+      paidDateTo?: string;
+      search?: string;
+      limit?: number;
+      page?: number;
+    },
+  ) {
+    const take = query?.limit ? Math.min(Number(query.limit), 200) : 50;
+    const skip = query?.page ? (Number(query.page) - 1) * take : 0;
+
+    const andConditions: any[] = [];
+    if (query?.channel && query.channel !== 'ALL') {
+      andConditions.push({ payment: { channel: query.channel } });
+    }
+    if (query?.classId?.trim()) {
+      const cid = query.classId.trim();
+      andConditions.push({
+        OR: [
+          { student: { classId: cid } },
+          { student: { studentProfile: { classId: cid } } },
+        ],
+      });
+    }
+    const paidDateRange = this.buildDateRange(query?.paidDateFrom, query?.paidDateTo);
+    if (paidDateRange) {
+      andConditions.push({
+        OR: [
+          { payment: { paidAt: paidDateRange } },
+          { issuedAt: paidDateRange },
+        ],
+      });
+    }
+    const studentSearchOr = this.buildStudentSearchOr(query?.search);
+    if (studentSearchOr) {
+      andConditions.push({
+        OR: [
+          { receiptNumber: { contains: query!.search!.trim(), mode: 'insensitive' } },
+          ...studentSearchOr,
+        ],
+      });
+    }
+
+    const where: any = {
+      schoolId,
+      ...(andConditions.length > 0 ? { AND: andConditions } : {}),
+    };
+
+    const [total, receipts] = await Promise.all([
+      this.prisma.financeReceipt.count({ where }),
+      this.prisma.financeReceipt.findMany({
+        where,
+        take,
+        skip,
+        include: {
+          student: {
+            select: {
+              id: true,
+              fullName: true,
+              loginId: true,
+              studentCode: true,
+              avatarUrl: true,
+              schoolClass: { select: { id: true, name: true } },
+              studentProfile: {
+                select: {
+                  matricOrAdmissionNo: true,
+                  level: true,
+                  schoolClass: { select: { id: true, name: true } },
+                },
+              },
+            },
+          },
+          invoice: {
+            select: {
+              id: true,
+              invoiceNumber: true,
+              feeStructure: {
+                select: {
+                  id: true,
+                  title: true,
+                  sessionName: true,
+                  termOrSemester: true,
+                },
+              },
+            },
+          },
+          payment: {
+            select: {
+              id: true,
+              amountKobo: true,
+              channel: true,
+              reference: true,
+              paystackReference: true,
+              posTerminalRef: true,
+              bankTellerNo: true,
+              paidAt: true,
+              createdAt: true,
+              recordedBy: { select: { id: true, fullName: true, role: true } },
+            },
+          },
+        },
+        orderBy: { issuedAt: 'desc' },
+      }),
+    ]);
+
+    return {
+      total,
+      page: query?.page || 1,
+      limit: take,
+      receipts,
+    };
+  }
+
+  async getClassPaymentReport(
+    schoolId: string,
+    classId: string,
+    params?: {
+      paymentStatus?: string;
+      paidDateFrom?: string;
+      paidDateTo?: string;
+      search?: string;
+    },
+  ) {
+    const schoolClass = await this.prisma.schoolClass.findFirst({
+      where: { id: classId, schoolId },
+      include: {
+        school: {
+          select: {
+            id: true,
+            name: true,
+            schoolCode: true,
+            logoUrl: true,
+            primaryColor: true,
+            institutionType: true,
+          },
+        },
+        department: { select: { id: true, name: true, code: true } },
+      },
+    });
+    if (!schoolClass) {
+      throw new NotFoundException('Class / Level not found in this institution.');
+    }
+
+    const rawStatus = String(params?.paymentStatus || 'PAID').trim().toUpperCase();
+    const paymentStatus: 'PAID' | 'PARTIALLY_PAID' | 'UNPAID' =
+      rawStatus === 'HALF_PAID' || rawStatus === 'PARTIALLY_PAID'
+        ? 'PARTIALLY_PAID'
+        : rawStatus === 'UNPAID'
+          ? 'UNPAID'
+          : 'PAID';
+
+    // Ensure every student in this class has up-to-date published invoices synced
+    const classStudentUsers = await this.prisma.user.findMany({
+      where: {
+        schoolId,
+        role: 'STUDENT',
+        OR: [{ classId }, { studentProfile: { classId } }],
+      },
+      select: { id: true },
+    });
+
+    for (const stu of classStudentUsers) {
+      await this.syncStudentInvoicesForActiveFees(schoolId, stu.id);
+    }
+
+    const andConditions: any[] = [
+      {
+        OR: [
+          { student: { classId } },
+          { student: { studentProfile: { classId } } },
+        ],
+      },
+    ];
+
+    if (paymentStatus === 'PAID') {
+      andConditions.push({
+        OR: [{ status: 'PAID' }, { balanceAmountKobo: { lte: 0 } }],
+      });
+    } else if (paymentStatus === 'PARTIALLY_PAID') {
+      andConditions.push({
+        paidAmountKobo: { gt: 0 },
+        balanceAmountKobo: { gt: 0 },
+      });
+    } else {
+      andConditions.push({
+        paidAmountKobo: 0,
+        balanceAmountKobo: { gt: 0 },
+      });
+    }
+
+    const paidDateRange = this.buildDateRange(params?.paidDateFrom, params?.paidDateTo);
+    if (paidDateRange) {
+      andConditions.push({
+        payments: {
+          some: {
+            status: 'VERIFIED',
+            paidAt: paidDateRange,
+          },
+        },
+      });
+    }
+
+    const studentSearchOr = this.buildStudentSearchOr(params?.search);
+    if (studentSearchOr) {
+      andConditions.push({
+        OR: [
+          { invoiceNumber: { contains: params!.search!.trim(), mode: 'insensitive' } },
+          ...studentSearchOr,
+        ],
+      });
+    }
+
+    const [invoices, currentTerm] = await Promise.all([
+      this.prisma.studentInvoice.findMany({
+        where: { schoolId, AND: andConditions },
+        include: {
+          student: {
+            select: {
+              id: true,
+              fullName: true,
+              loginId: true,
+              studentCode: true,
+              avatarUrl: true,
+              studentProfile: {
+                select: {
+                  matricOrAdmissionNo: true,
+                  level: true,
+                },
+              },
+            },
+          },
+          feeStructure: {
+            select: {
+              id: true,
+              title: true,
+              sessionName: true,
+              termOrSemester: true,
+            },
+          },
+          payments: {
+            where: { status: 'VERIFIED' },
+            orderBy: { paidAt: 'desc' },
+            select: {
+              id: true,
+              amountKobo: true,
+              channel: true,
+              paidAt: true,
+              createdAt: true,
+            },
+          },
+        },
+        orderBy: [{ student: { fullName: 'asc' } }, { createdAt: 'desc' }],
+      }),
+      this.prisma.academicTerm.findFirst({
+        where: { session: { schoolId } },
+        orderBy: [{ isCurrent: 'desc' }, { createdAt: 'desc' }],
+        include: { session: { select: { name: true } } },
+      }),
+    ]);
+
+    const rows = invoices.map((inv) => {
+      const latestPayment = inv.payments[0] || null;
+      return {
+        invoiceId: inv.id,
+        invoiceNumber: inv.invoiceNumber,
+        studentId: inv.studentId,
+        fullName: inv.student.fullName || 'Student',
+        uniqueId:
+          inv.student.studentProfile?.matricOrAdmissionNo ||
+          inv.student.loginId ||
+          inv.student.studentCode ||
+          'N/A',
+        feeTitle: inv.feeStructure?.title || 'Academic Fee',
+        sessionName: inv.feeStructure?.sessionName || currentTerm?.session?.name || '',
+        termName: inv.feeStructure?.termOrSemester || currentTerm?.name || '',
+        totalAmountKobo: inv.totalAmountKobo,
+        paidAmountKobo: inv.paidAmountKobo,
+        balanceAmountKobo: inv.balanceAmountKobo,
+        status: inv.status,
+        lastPaidAt:
+          latestPayment?.paidAt?.toISOString() ||
+          latestPayment?.createdAt?.toISOString() ||
+          inv.clearedAt?.toISOString() ||
+          null,
+        lastChannel: latestPayment?.channel || null,
+      };
+    });
+
+    const totalInvoicedKobo = rows.reduce((sum, r) => sum + r.totalAmountKobo, 0);
+    const totalPaidKobo = rows.reduce((sum, r) => sum + r.paidAmountKobo, 0);
+    const totalBalanceKobo = rows.reduce((sum, r) => sum + r.balanceAmountKobo, 0);
+
+    return {
+      school: schoolClass.school,
+      schoolClass: {
+        id: schoolClass.id,
+        name: schoolClass.name,
+        levelCode: schoolClass.levelCode,
+        departmentName: schoolClass.department?.name || null,
+      },
+      currentTerm: currentTerm
+        ? {
+            id: currentTerm.id,
+            name: currentTerm.name,
+            sessionName: currentTerm.session?.name || '',
+          }
+        : null,
+      paymentStatus,
+      filters: {
+        paidDateFrom: params?.paidDateFrom || null,
+        paidDateTo: params?.paidDateTo || null,
+        search: params?.search?.trim() || null,
+      },
+      generatedAt: new Date().toISOString(),
+      summary: {
+        count: rows.length,
+        totalStudentsInClass: classStudentUsers.length,
+        totalInvoicedKobo,
+        totalPaidKobo,
+        totalBalanceKobo,
+      },
+      rows,
+    };
   }
 }

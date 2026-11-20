@@ -258,6 +258,12 @@ export class SchoolsService {
         include: {
           department: true,
           subjects: true,
+          _count: {
+            select: {
+              studentProfiles: true,
+              subjects: true,
+            },
+          },
         },
         orderBy: { name: 'asc' },
       }),
@@ -274,11 +280,38 @@ export class SchoolsService {
       }),
     ]);
 
+    const formTeacherIds = Array.from(
+      new Set(allClasses.map((c) => c.formTeacherId).filter((id): id is string => Boolean(id))),
+    );
+    const formTeacherMap = new Map<
+      string,
+      { id: string; fullName: string; avatarUrl: string | null; email: string }
+    >();
+    if (formTeacherIds.length > 0) {
+      const ftUsers = await this.prisma.user.findMany({
+        where: { id: { in: formTeacherIds }, schoolId },
+        select: { id: true, fullName: true, avatarUrl: true, email: true },
+      });
+      ftUsers.forEach((u) => {
+        formTeacherMap.set(u.id, {
+          id: u.id,
+          fullName: u.fullName || 'Teacher',
+          avatarUrl: u.avatarUrl || null,
+          email: u.email,
+        });
+      });
+    }
+
+    const enrichedClasses = allClasses.map((cls) => ({
+      ...cls,
+      formTeacher: cls.formTeacherId ? formTeacherMap.get(cls.formTeacherId) || null : null,
+    }));
+
     return {
       success: true,
       academicUnits: units,
       unassignedDepartments,
-      allClasses,
+      allClasses: enrichedClasses,
       allSubjects,
     };
   }
@@ -918,10 +951,10 @@ export class SchoolsService {
         },
         subjects: {
           include: {
-            teacher: { select: { id: true, fullName: true, email: true } },
+            teacher: { select: { id: true, fullName: true, email: true, avatarUrl: true } },
             assignedTeachers: {
               include: {
-                user: { select: { id: true, fullName: true, email: true } },
+                user: { select: { id: true, fullName: true, email: true, avatarUrl: true } },
               },
             },
           },
@@ -929,7 +962,7 @@ export class SchoolsService {
         },
         teacherProfiles: {
           include: {
-            user: { select: { id: true, fullName: true, email: true } },
+            user: { select: { id: true, fullName: true, email: true, avatarUrl: true } },
             assignedSubjects: {
               where: { classId },
               select: { id: true, name: true, courseCode: true },
@@ -1002,7 +1035,7 @@ export class SchoolsService {
         ? this.prisma.teacherProfile.findFirst({
             where: { schoolId, userId: schoolClass.formTeacherId },
             include: {
-              user: { select: { id: true, fullName: true, email: true } },
+              user: { select: { id: true, fullName: true, email: true, avatarUrl: true } },
             },
           })
         : Promise.resolve(null),
@@ -1053,6 +1086,7 @@ export class SchoolsService {
       studentProfileId: string | null;
       userId: string;
       fullName: string;
+      avatarUrl: string | null;
       matricOrAdmissionNo: string;
       overallAverage: number;
       gpa: number | null;
@@ -1081,6 +1115,7 @@ export class SchoolsService {
               studentProfileId: sp.id,
               userId: sp.userId,
               fullName: sp.user.fullName || 'Student',
+              avatarUrl: sp.user.avatarUrl || null,
               matricOrAdmissionNo: sp.matricOrAdmissionNo || sp.user.loginId || 'N/A',
               overallAverage: Math.round((Number(rc.overallAverage) || 0) * 10) / 10,
               gpa: rc.gpa != null ? Math.round(Number(rc.gpa) * 100) / 100 : null,
@@ -1110,6 +1145,7 @@ export class SchoolsService {
               studentProfileId: sp.id,
               userId: uid,
               fullName: sp.user.fullName || 'Student',
+              avatarUrl: sp.user.avatarUrl || null,
               matricOrAdmissionNo: sp.matricOrAdmissionNo || sp.user.loginId || 'N/A',
               overallAverage: Math.round((stats.sum / stats.count) * 10) / 10,
               gpa: Math.round((stats.gpSum / stats.count) * 100) / 100,
@@ -1134,6 +1170,7 @@ export class SchoolsService {
         title: string;
         staffId: string;
         email: string;
+        avatarUrl: string | null;
         roles: Set<string>;
         subjects: Set<string>;
       }
@@ -1147,6 +1184,7 @@ export class SchoolsService {
         title?: string | null;
         staffId?: string | null;
         email?: string | null;
+        avatarUrl?: string | null;
       },
       role?: string,
       subjectName?: string,
@@ -1160,10 +1198,13 @@ export class SchoolsService {
           title: info.title || (isTertiary ? 'Lecturer' : 'Teacher'),
           staffId: info.staffId || 'STAFF',
           email: info.email || '',
+          avatarUrl: info.avatarUrl || null,
           roles: new Set<string>(),
           subjects: new Set<string>(),
         };
         teacherMap.set(userId, entry);
+      } else if (!entry.avatarUrl && info.avatarUrl) {
+        entry.avatarUrl = info.avatarUrl;
       }
       if (role) entry.roles.add(role);
       if (subjectName) entry.subjects.add(subjectName);
@@ -1178,6 +1219,7 @@ export class SchoolsService {
           title: formTeacherUser.title,
           staffId: formTeacherUser.staffId,
           email: formTeacherUser.user?.email,
+          avatarUrl: formTeacherUser.user?.avatarUrl,
         },
         'Form Teacher',
       );
@@ -1192,6 +1234,7 @@ export class SchoolsService {
           title: tp.title,
           staffId: tp.staffId,
           email: tp.user?.email,
+          avatarUrl: tp.user?.avatarUrl,
         },
         isTertiary ? 'Course Lecturer' : 'Class Teacher',
       );
@@ -1212,6 +1255,7 @@ export class SchoolsService {
           {
             fullName: subj.teacher.fullName,
             email: subj.teacher.email,
+            avatarUrl: subj.teacher.avatarUrl,
           },
           isTertiary ? 'Course Lecturer' : 'Subject Teacher',
           subj.name,
@@ -1226,6 +1270,7 @@ export class SchoolsService {
             title: tp.title,
             staffId: tp.staffId,
             email: tp.user?.email,
+            avatarUrl: tp.user?.avatarUrl,
           },
           isTertiary ? 'Course Lecturer' : 'Subject Teacher',
           subj.name,
@@ -1240,6 +1285,7 @@ export class SchoolsService {
       title: t.title,
       staffId: t.staffId,
       email: t.email,
+      avatarUrl: t.avatarUrl,
       roles: Array.from(t.roles),
       subjects: Array.from(t.subjects),
     }));
@@ -1345,6 +1391,17 @@ export class SchoolsService {
       students,
       newStudents,
       leadingStudents,
+      formTeacher: formTeacherUser
+        ? {
+            teacherProfileId: formTeacherUser.id,
+            userId: formTeacherUser.userId,
+            fullName: formTeacherUser.user?.fullName || 'Form Teacher',
+            title: formTeacherUser.title || (isTertiary ? 'Academic Advisor' : 'Form Teacher'),
+            staffId: formTeacherUser.staffId || 'STAFF',
+            email: formTeacherUser.user?.email || '',
+            avatarUrl: formTeacherUser.user?.avatarUrl || null,
+          }
+        : null,
       currentTeachers,
       pastTeachers,
       attendanceSummary: {
@@ -1754,7 +1811,7 @@ export class SchoolsService {
 
   private async generateUniqueMemberId(
     school: { name?: string | null; schoolCode?: string | null },
-    roleCode: 'TCH' | 'STU',
+    roleCode: string,
   ): Promise<string> {
     const prefix = this.buildSchoolIdPrefix(school.name, school.schoolCode);
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -1780,6 +1837,7 @@ export class SchoolsService {
     dto: {
       fullName: string;
       staffId?: string;
+      role?: string;
       email?: string;
       title?: string;
       departmentId?: string;
@@ -1807,6 +1865,20 @@ export class SchoolsService {
 
     const providedStaffId = dto.staffId?.trim().toUpperCase();
     let cleanStaffId = providedStaffId;
+    const rawRole = (dto.role || 'TEACHER').toUpperCase();
+    const assignedRole =
+      rawRole === 'SCHOOL_FINANCE' || rawRole === 'BURSAR' || rawRole === 'BURSARY'
+        ? 'SCHOOL_FINANCE'
+        : rawRole === 'SCHOOL_ADMIN' || rawRole === 'ADMIN'
+        ? 'SCHOOL_ADMIN'
+        : 'TEACHER';
+    const rolePrefix =
+      assignedRole === 'SCHOOL_FINANCE'
+        ? 'BUR'
+        : assignedRole === 'SCHOOL_ADMIN'
+        ? 'ADM'
+        : 'TCH';
+
     if (cleanStaffId) {
       const taken = await this.isMemberIdTakenGlobally(cleanStaffId);
       if (taken) {
@@ -1815,12 +1887,13 @@ export class SchoolsService {
         );
       }
     } else {
-      cleanStaffId = await this.generateUniqueMemberId(school, 'TCH');
+      cleanStaffId = await this.generateUniqueMemberId(school, rolePrefix);
     }
 
     const safeSlug = (school.slug || 'school').toLowerCase().replace(/[^a-z0-9]/g, '');
     const cleanId = cleanStaffId.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const staffEmail = dto.email?.trim()?.toLowerCase() || `${cleanId}@${safeSlug}.spark`;
+    const staffEmail =
+      dto.email?.trim()?.toLowerCase() || `${cleanId}@${safeSlug}.studentspark.ng`;
 
     const commonPassword = 'SparkPass2026!';
     const passwordHash = await bcrypt.hash(commonPassword, 10);
@@ -1832,7 +1905,7 @@ export class SchoolsService {
           email: staffEmail,
           fullName: dto.fullName.trim(),
           passwordHash,
-          role: 'TEACHER',
+          role: assignedRole,
           schoolId,
           loginId: cleanStaffId,
           mustChangePassword: true,
@@ -1844,7 +1917,7 @@ export class SchoolsService {
         where: { id: user.id },
         data: {
           fullName: dto.fullName.trim(),
-          role: 'TEACHER',
+          role: assignedRole,
           schoolId,
           loginId: cleanStaffId,
           mustChangePassword: true,
@@ -1860,10 +1933,18 @@ export class SchoolsService {
         data: {
           userId: user.id,
           schoolId,
-          role: 'TEACHER',
+          role: assignedRole,
           loginId: cleanStaffId,
           mustChangePassword: true,
           status: 'ACTIVE',
+        },
+      });
+    } else {
+      membership = await this.prisma.membership.update({
+        where: { id: membership.id },
+        data: {
+          role: assignedRole,
+          loginId: cleanStaffId,
         },
       });
     }
@@ -1982,7 +2063,8 @@ export class SchoolsService {
       },
       credentialSlip: {
         fullName: dto.fullName.trim(),
-        title: dto.title?.trim() || defaultEducatorTitle,
+        title: dto.title?.trim() || (assignedRole === 'SCHOOL_FINANCE' ? 'Bursar' : defaultEducatorTitle),
+        role: assignedRole,
         staffId: cleanStaffId,
         loginId: cleanStaffId,
         email: staffEmail,
@@ -2327,7 +2409,27 @@ export class SchoolsService {
 
     const safeSlug = (school.slug || 'school').toLowerCase().replace(/[^a-z0-9]/g, '');
     const cleanId = cleanMatric.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const studentEmail = dto.email?.trim()?.toLowerCase() || `${cleanId}@${safeSlug}.spark`;
+    const studentEmail =
+      dto.email?.trim()?.toLowerCase() || `${cleanId}@${safeSlug}.studentspark.ng`;
+
+    const selectedClass = dto.classId
+      ? await this.prisma.schoolClass.findFirst({
+          where: { id: dto.classId, schoolId },
+        })
+      : null;
+    if (dto.classId && !selectedClass) {
+      throw new BadRequestException('Selected class does not belong to this institution.');
+    }
+
+    const instUpper = String(school.institutionType || '').toUpperCase();
+    const isTertiary = ['UNIVERSITY', 'POLYTECHNIC', 'COLLEGE_OF_EDUCATION', 'TERTIARY'].includes(
+      instUpper,
+    );
+    const resolvedLevel =
+      selectedClass?.name && (!isTertiary || !dto.level?.trim() || dto.level.trim() === '100L')
+        ? selectedClass.name
+        : dto.level?.trim() || (isTertiary ? '100L' : selectedClass?.name || 'General');
+    const resolvedDepartmentId = dto.departmentId || selectedClass?.departmentId || null;
 
     const commonPassword = 'SparkPass2026!';
     const passwordHash = await bcrypt.hash(commonPassword, 10);
@@ -2382,9 +2484,9 @@ export class SchoolsService {
         userId: user.id,
         schoolId,
         matricOrAdmissionNo: cleanMatric,
-        departmentId: dto.departmentId || null,
+        departmentId: resolvedDepartmentId,
         classId: dto.classId || null,
-        level: dto.level?.trim() || '100L',
+        level: resolvedLevel,
         age: this.normalizeStudentAge(dto.age),
         guardianName: dto.guardianName?.trim() || null,
         guardianRelationship: dto.guardianRelationship?.trim() || null,
@@ -2407,7 +2509,7 @@ export class SchoolsService {
         loginId: cleanMatric,
         email: studentEmail,
         initialPassword: commonPassword,
-        level: dto.level || '100L',
+        level: resolvedLevel,
         schoolName: school.name,
         schoolCode: school.schoolCode,
         generatedAt: new Date().toISOString(),
@@ -2476,7 +2578,10 @@ export class SchoolsService {
       if (!cls) {
         throw new BadRequestException('Selected class does not belong to this institution.');
       }
-      if (!dto.level && cls.name) {
+      if (
+        cls.name &&
+        (!dto.level?.trim() || dto.level.trim() === '100L' || dto.classId !== undefined)
+      ) {
         resolvedLevel = cls.name;
       }
       if (dto.departmentId === undefined && !resolvedDeptId && cls.departmentId) {

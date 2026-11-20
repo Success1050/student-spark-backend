@@ -77,10 +77,43 @@ export class StorageService {
     }
   }
 
+  async uploadDocumentBuffer(
+    fileBuffer: Buffer,
+    fileName: string,
+    folder: 'community-docs' | 'notes' | 'past-questions' | 'marketplace' | 'report-cards' = 'community-docs',
+  ): Promise<{ filePath: string; publicUrl: string }> {
+    this.logger.log(`Uploading document ${fileName} (${fileBuffer.byteLength} bytes) to Cloudinary/${folder}`);
+
+    // Strip trailing .pdf from Cloudinary raw public_id so direct delivery
+    // never triggers Cloudinary's raw .pdf ACL restriction (HTTP 401).
+    const cleanPublicId = fileName.replace(/\.pdf$/i, '');
+
+    return new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          folder: `studentspark/${folder}`,
+          public_id: cleanPublicId,
+          resource_type: 'raw',
+        },
+        (error, result) => {
+          if (error || !result) {
+            this.logger.error('Cloudinary document upload error', error);
+            return reject(error ?? new Error('Cloudinary document upload failed'));
+          }
+          resolve({
+            filePath: result.public_id,
+            publicUrl: result.secure_url,
+          });
+        },
+      );
+      uploadStream.end(fileBuffer);
+    });
+  }
+
   async uploadImageBuffer(
     fileBuffer: Buffer,
     fileName: string,
-    folder: 'sug-candidates' | 'avatars' | 'marketplace' = 'sug-candidates',
+    folder: 'sug-candidates' | 'avatars' | 'marketplace' | 'community-images' = 'sug-candidates',
   ): Promise<{ filePath: string; publicUrl: string }> {
     this.logger.log(`Uploading image ${fileName} (${fileBuffer.byteLength} bytes) to Cloudinary/${folder}`);
 

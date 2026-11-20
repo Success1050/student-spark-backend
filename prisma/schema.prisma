@@ -246,6 +246,11 @@ model School {
   reconciliationBatches     ReconciliationBatch[]
   financeReceipts           FinanceReceipt[]
   financialAuditLogs        FinancialAuditLog[]
+  promotionBatches          PromotionBatch[]
+  promotionClassReviews     PromotionClassReview[]
+  hostedTournaments         AcademicTournament[]        @relation("TournamentHostSchool")
+  tournamentEntries         TournamentEntry[]
+  tournamentSpectatorEvents TournamentSpectatorEvent[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -254,14 +259,16 @@ model School {
 }
 
 model AcademicSession {
-  id        String         @id @default(uuid())
-  schoolId  String
-  school    School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
-  name      String
-  isCurrent Boolean        @default(false)
-  terms     AcademicTerm[]
-  createdAt DateTime       @default(now())
-  updatedAt DateTime       @updatedAt
+  id                    String                 @id @default(uuid())
+  schoolId              String
+  school                School                 @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  name                  String
+  isCurrent             Boolean                @default(false)
+  terms                 AcademicTerm[]
+  promotionBatches      PromotionBatch[]
+  promotionClassReviews PromotionClassReview[]
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
 
   @@index([schoolId])
   @@map("academic_sessions")
@@ -396,6 +403,7 @@ model SchoolClass {
   sugOnboardingCampaigns   SugOnboardingCampaign[]
   sugOfficeHolders         SugOfficeHolder[]
   feeStructures            FeeStructure[]
+  promotionClassReviews    PromotionClassReview[]
   createdAt          DateTime              @default(now())
   updatedAt          DateTime              @updatedAt
 
@@ -510,6 +518,9 @@ model User {
   createdCommunities   StudyCommunity[]
   communityMemberships CommunityMember[]
   communityMessages    CommunityMessage[]
+  dmConversationsA     DirectConversation[]  @relation("DmParticipantA")
+  dmConversationsB     DirectConversation[]  @relation("DmParticipantB")
+  directMessagesSent   DirectMessage[]       @relation("DmSender")
   hostedGames          GameMatch[]           @relation("HostUserGames")
   opponentGames        GameMatch[]           @relation("OpponentUserGames")
   notifications        Notification[]
@@ -542,9 +553,18 @@ model User {
   paymentEvidences          PaymentEvidence[]          @relation("StudentEvidences")
   reviewedEvidences         PaymentEvidence[]          @relation("ReviewedEvidences")
   createdFeeStructures      FeeStructure[]             @relation("FeeStructureCreator")
+  approvedFeeStructures     FeeStructure[]             @relation("FeeStructureApprover")
   uploadedReconciliationBatches ReconciliationBatch[]  @relation("ReconciliationUploader")
   studentReceipts           FinanceReceipt[]           @relation("StudentReceipts")
   financialAuditLogs        FinancialAuditLog[]        @relation("ActorFinancialAudits")
+  executedPromotionBatches  PromotionBatch[]           @relation("PromotionBatchExecutor")
+  rolledBackPromotionBatches PromotionBatch[]          @relation("PromotionBatchRollbacker")
+  promotionEntries          PromotionBatchEntry[]      @relation("PromotionEntryStudent")
+  reviewedPromotionClasses  PromotionClassReview[]     @relation("PromotionClassReviewer")
+  createdTournaments        AcademicTournament[]       @relation("TournamentCreator")
+  tournamentEntries         TournamentEntry[]          @relation("TournamentParticipant")
+  registeredTournamentEntries TournamentEntry[]        @relation("TournamentRegistrar")
+  tournamentSpectatorEvents TournamentSpectatorEvent[] @relation("TournamentSpectator")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -628,12 +648,15 @@ model StudentProfile {
   cgpa                 Float        @default(0.0)
   totalCredits         Int          @default(0)
   isCourseRep          Boolean      @default(false)
+  academicStatus       String       @default("ACTIVE") // ACTIVE | GRADUATED | WITHDRAWN
+  graduatedAt          DateTime?
   createdAt            DateTime     @default(now())
   updatedAt            DateTime     @updatedAt
 
   @@unique([schoolId, matricOrAdmissionNo])
   @@index([schoolId, departmentId])
   @@index([schoolId, classId])
+  @@index([schoolId, academicStatus])
   @@index([matricOrAdmissionNo])
   @@map("student_profiles")
 }
@@ -1211,23 +1234,33 @@ model StudyCommunity {
   iconUrl             String?
   inviteCode          String             @unique
   isOfficialSchoolHub Boolean            @default(false)
+  zone                String             @default("MY_CAMPUS") // MY_CAMPUS | CROSS_SCHOOL
+  category            String             @default("GENERAL") // GENERAL | FACULTY | DEPARTMENT | CLASS | EXAM_PREP | STEM | ARTS | TECH | STUDY_LOUNGE
+  unitId              String?
+  departmentId        String?
+  classId             String?
+  isPublic            Boolean            @default(true)
   channels            CommunityChannel[]
   members             CommunityMember[]
   createdAt           DateTime           @default(now())
   updatedAt           DateTime           @updatedAt
 
   @@index([schoolId])
+  @@index([zone, schoolId])
   @@map("study_communities")
 }
 
 model CommunityChannel {
-  id          String             @id @default(uuid())
-  communityId String
-  community   StudyCommunity     @relation(fields: [communityId], references: [id], onDelete: Cascade)
-  name        String
-  topic       String?
-  messages    CommunityMessage[]
-  createdAt   DateTime           @default(now())
+  id                    String             @id @default(uuid())
+  communityId           String
+  community             StudyCommunity     @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  name                  String
+  topic                 String?
+  channelType           String             @default("TEXT") // TEXT | ANNOUNCEMENTS | STUDY_MATERIALS | QNA
+  isDefault             Boolean            @default(false)
+  isReadOnlyForStudents Boolean            @default(false)
+  messages              CommunityMessage[]
+  createdAt             DateTime           @default(now())
 
   @@index([communityId])
   @@map("community_channels")
@@ -1247,19 +1280,61 @@ model CommunityMember {
 }
 
 model CommunityMessage {
-  id             String           @id @default(uuid())
+  id             String             @id @default(uuid())
   channelId      String
-  channel        CommunityChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  channel        CommunityChannel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
   senderId       String
-  sender         User             @relation(fields: [senderId], references: [id], onDelete: Cascade)
-  content        String           @db.Text
+  sender         User               @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  content        String             @db.Text
   attachmentType String?
   attachmentId   String?
   attachmentMeta Json?
-  createdAt      DateTime         @default(now())
+  replyToId      String?
+  replyTo        CommunityMessage?  @relation("CommunityMessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies        CommunityMessage[] @relation("CommunityMessageReplies")
+  isPinned       Boolean            @default(false)
+  reactionsJson  Json?
+  createdAt      DateTime           @default(now())
 
   @@index([channelId, createdAt])
   @@map("community_messages")
+}
+
+model DirectConversation {
+  id              String          @id @default(uuid())
+  participantAId  String
+  participantA    User            @relation("DmParticipantA", fields: [participantAId], references: [id], onDelete: Cascade)
+  participantBId  String
+  participantB    User            @relation("DmParticipantB", fields: [participantBId], references: [id], onDelete: Cascade)
+  lastMessageText String?
+  lastMessageAt   DateTime?
+  lastSenderId    String?
+  messages        DirectMessage[]
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@unique([participantAId, participantBId])
+  @@index([participantAId, lastMessageAt])
+  @@index([participantBId, lastMessageAt])
+  @@map("direct_conversations")
+}
+
+model DirectMessage {
+  id             String             @id @default(uuid())
+  conversationId String
+  conversation   DirectConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User               @relation("DmSender", fields: [senderId], references: [id], onDelete: Cascade)
+  content        String             @db.Text
+  attachmentType String?
+  attachmentId   String?
+  attachmentMeta Json?
+  readAt         DateTime?
+  createdAt      DateTime           @default(now())
+
+  @@index([conversationId, createdAt])
+  @@index([senderId])
+  @@map("direct_messages")
 }
 
 model GameMatch {
@@ -1760,6 +1835,12 @@ model FeeStructure {
   minimumPartialKobo  Int              @default(0)
   totalAmountKobo     Int              @default(0)
   isPublished         Boolean          @default(true)
+  approvalStatus      String           @default("APPROVED") // PENDING_APPROVAL | APPROVED | REJECTED
+  approvedById        String?
+  approvedBy          User?            @relation("FeeStructureApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt          DateTime?
+  rejectionReason     String?
+  billingPeriod       String           @default("PER_SESSION") // PER_SESSION | PER_SEMESTER | PER_TERM | ONE_TIME
   createdById         String?
   createdBy           User?            @relation("FeeStructureCreator", fields: [createdById], references: [id], onDelete: SetNull)
   feeItems            FeeItem[]
@@ -1962,4 +2043,199 @@ model FinancialAuditLog {
   @@index([schoolId, action, createdAt])
   @@index([actorId, createdAt])
   @@map("financial_audit_logs")
+}
+
+// ============================================================================
+// DAY 16B: SMART 1-CLICK CLASS PROMOTION & SESSION ROLLOVER ENGINE
+// ============================================================================
+
+model PromotionBatch {
+  id                      String                @id @default(uuid())
+  schoolId                String
+  school                  School                @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  fromSessionId           String?
+  fromSession             AcademicSession?      @relation(fields: [fromSessionId], references: [id], onDelete: SetNull)
+  fromSessionName         String
+  toSessionName           String?
+  scopeType               String                @default("SINGLE_CLASS") // SINGLE_CLASS | SCHOOL_WIDE
+  status                  String                @default("EXECUTED") // EXECUTED | ROLLED_BACK
+  passMarkPercent         Float                 @default(50)
+  trialMarkPercent        Float                 @default(40)
+  totalProcessed          Int                   @default(0)
+  promotedCount           Int                   @default(0)
+  repeatedCount           Int                   @default(0)
+  graduatedCount          Int                   @default(0)
+  autoCreatedClassesCount Int                   @default(0)
+  generatedInvoicesCount  Int                   @default(0)
+  executedById            String?
+  executedBy              User?                 @relation("PromotionBatchExecutor", fields: [executedById], references: [id], onDelete: SetNull)
+  rolledBackById          String?
+  rolledBackBy            User?                 @relation("PromotionBatchRollbacker", fields: [rolledBackById], references: [id], onDelete: SetNull)
+  rolledBackAt            DateTime?
+  canUndoUntil            DateTime?
+  notes                   String?
+  entries                 PromotionBatchEntry[]
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
+
+  @@index([schoolId, createdAt])
+  @@index([schoolId, status])
+  @@map("promotion_batches")
+}
+
+model PromotionBatchEntry {
+  id                 String         @id @default(uuid())
+  batchId            String
+  batch              PromotionBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  studentId          String
+  student            User           @relation("PromotionEntryStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  fromClassId        String?
+  fromClassName      String?
+  fromLevel          String?
+  fromAcademicStatus String         @default("ACTIVE")
+  toClassId          String?
+  toClassName        String?
+  toLevel            String?
+  toAcademicStatus   String         @default("ACTIVE")
+  decision           String         // PROMOTED | ON_TRIAL | REPEATED | GRADUATED
+  annualAverage      Float?
+  unpaidArrearsKobo  Int            @default(0)
+  createdInvoiceIds  String[]       @default([])
+  createdAt          DateTime       @default(now())
+
+  @@index([batchId])
+  @@index([studentId])
+  @@map("promotion_batch_entries")
+}
+
+model PromotionClassReview {
+  id             String           @id @default(uuid())
+  schoolId       String
+  school         School           @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  sessionId      String?
+  session        AcademicSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  classId        String
+  schoolClass    SchoolClass      @relation(fields: [classId], references: [id], onDelete: Cascade)
+  reviewedById   String?
+  reviewedBy     User?            @relation("PromotionClassReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  exceptionsJson Json?            // Map of studentId -> { decision, targetClassId?, note? }
+  confirmedAt    DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@unique([schoolId, classId])
+  @@index([schoolId, sessionId])
+  @@map("promotion_class_reviews")
+}
+
+// ============================================================================
+// DAY 18: INTER-SCHOOL TOURNAMENTS & ACADEMIC OLYMPIADS
+// ============================================================================
+
+model AcademicTournament {
+  id                       String                      @id @default(uuid())
+  code                     String                      @unique
+  title                    String
+  description              String?
+  subjectArea              String
+  status                   String                      @default("REGISTRATION_OPEN") // DRAFT | REGISTRATION_OPEN | LIVE | COMPLETED | CANCELLED
+  targetInstitutionTypes   String[]                    @default([])
+  allowedDepartments       String[]                    @default([])
+  allowedLevels            String[]                    @default([])
+  allowIndependentLearners Boolean                     @default(false)
+  maxParticipantsPerSchool Int                         @default(3)
+  maxTotalParticipants     Int                         @default(100)
+  requireAdminApproval     Boolean                     @default(true)
+  questionCount            Int                         @default(8)
+  secondsPerQuestion       Int                         @default(20)
+  maxTabSwitchesAllowed    Int                         @default(2)
+  prizePoolText            String?
+  xpRewardFirst            Int                         @default(500)
+  xpRewardSecond           Int                         @default(300)
+  xpRewardThird            Int                         @default(200)
+  startsAt                 DateTime?
+  endsAt                   DateTime?
+  hostSchoolId             String?
+  hostSchool               School?                     @relation("TournamentHostSchool", fields: [hostSchoolId], references: [id], onDelete: SetNull)
+  createdById              String
+  createdBy                User                        @relation("TournamentCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  questions                TournamentQuestion[]
+  entries                  TournamentEntry[]
+  spectatorEvents          TournamentSpectatorEvent[]
+  createdAt                DateTime                    @default(now())
+  updatedAt                DateTime                    @updatedAt
+
+  @@index([status, startsAt])
+  @@map("academic_tournaments")
+}
+
+model TournamentQuestion {
+  id               String             @id @default(uuid())
+  tournamentId     String
+  tournament       AcademicTournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  orderIndex       Int
+  prompt           String
+  optionsJson      Json
+  correctIndex     Int
+  explanation      String?
+  points           Int                @default(100)
+  timeLimitSeconds Int                @default(20)
+  createdAt        DateTime           @default(now())
+
+  @@unique([tournamentId, orderIndex])
+  @@index([tournamentId])
+  @@map("tournament_questions")
+}
+
+model TournamentEntry {
+  id                          String             @id @default(uuid())
+  tournamentId                String
+  tournament                  AcademicTournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  userId                      String
+  user                        User               @relation("TournamentParticipant", fields: [userId], references: [id], onDelete: Cascade)
+  schoolId                    String?
+  school                      School?            @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+  registeredById              String?
+  registeredBy                User?              @relation("TournamentRegistrar", fields: [registeredById], references: [id], onDelete: SetNull)
+  registrationSource          String             @default("ADMIN_NOMINATED")
+  status                      String             @default("REGISTERED") // PENDING_APPROVAL | REGISTERED | PLAYING | COMPLETED | DISQUALIFIED
+  verifiedInstitutionType     String?
+  verifiedDepartmentName      String?
+  verifiedLevelOrClass        String?
+  verifiedMatricOrAdmissionNo String?
+  currentQuestionIndex        Int                @default(0)
+  totalScore                  Int                @default(0)
+  correctCount                Int                @default(0)
+  answeredCount               Int                @default(0)
+  totalResponseTimeMs         Int                @default(0)
+  answersJson                 Json?
+  tabSwitchCount              Int                @default(0)
+  antiCheatFlagsJson          Json?
+  disqualificationReason      String?
+  startedAt                   DateTime?
+  completedAt                 DateTime?
+  xpAwarded                   Int                @default(0)
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
+
+  @@unique([tournamentId, userId])
+  @@index([tournamentId, schoolId, status])
+  @@index([tournamentId, totalScore, totalResponseTimeMs])
+  @@map("tournament_entries")
+}
+
+model TournamentSpectatorEvent {
+  id           String             @id @default(uuid())
+  tournamentId String
+  tournament   AcademicTournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  userId       String?
+  user         User?              @relation("TournamentSpectator", fields: [userId], references: [id], onDelete: SetNull)
+  schoolId     String?
+  school       School?            @relation(fields: [schoolId], references: [id], onDelete: SetNull)
+  eventType    String             @default("CHEER") // CHEER | COMMENTARY | MILESTONE | VIOLATION
+  message      String
+  emoji        String?
+  createdAt    DateTime           @default(now())
+
+  @@index([tournamentId, createdAt])
+  @@map("tournament_spectator_events")
 }

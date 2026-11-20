@@ -30,6 +30,8 @@ import { TeacherModule } from './modules/teacher/teacher.module.js';
 import { CourseRepModule } from './modules/course-rep/course-rep.module.js';
 import { SugModule } from './modules/sug/sug.module.js';
 import { FinanceModule } from './modules/finance/finance.module.js';
+import { PromotionsModule } from './modules/promotions/promotions.module.js';
+import { TournamentsModule } from './modules/tournaments/tournaments.module.js';
 import { UserContextMiddleware } from './common/middleware/user-context.middleware.js';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { AuditLogInterceptor } from './common/interceptors/audit-log.interceptor.js';
@@ -74,6 +76,8 @@ import { AuditLogInterceptor } from './common/interceptors/audit-log.interceptor
     CourseRepModule,
     SugModule,
     FinanceModule,
+    PromotionsModule,
+    TournamentsModule,
   ],
   controllers: [AppController],
   providers: [

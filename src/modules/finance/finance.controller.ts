@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Param,
   Patch,
@@ -17,8 +18,11 @@ import { RolesGuard } from '../../common/guards/roles.guard.js';
 import { PrismaService } from '../../database/prisma.service.js';
 import {
   CreateFeeStructureDto,
+  UpdateFeeStructureDto,
   CreatePaymentAccountDto,
   UpdatePaymentAccountDto,
+  ApproveFeeStructureDto,
+  RejectFeeStructureDto,
   InitOnlinePaymentDto,
   ReconciliationCsvDto,
   RecordWalkInPaymentDto,
@@ -37,20 +41,30 @@ export class FinanceController {
   ) {}
 
   private async resolveSchoolId(userId: string, explicitSchoolId?: string): Promise<{ schoolId: string; role: string }> {
-    if (explicitSchoolId) {
-      const user = await this.prisma.user.findUnique({
-        where: { id: userId },
-        select: { role: true },
-      });
-      return { schoolId: explicitSchoolId, role: user?.role || 'STUDENT' };
-    }
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { schoolId: true, role: true },
     });
-    if (!user?.schoolId) {
+    if (!user) {
+      throw new BadRequestException('Authenticated user account not found.');
+    }
+
+    if (user.role === 'SUPER_ADMIN') {
+      const targetSchoolId = explicitSchoolId || user.schoolId;
+      if (!targetSchoolId) {
+        throw new BadRequestException('Target schoolId is required.');
+      }
+      return { schoolId: targetSchoolId, role: user.role };
+    }
+
+    if (!user.schoolId) {
       throw new BadRequestException('User is not assigned to an active institution.');
     }
+
+    if (explicitSchoolId && explicitSchoolId !== user.schoolId) {
+      throw new ForbiddenException('Cross-tenant access denied: You cannot access another institution.');
+    }
+
     return { schoolId: user.schoolId, role: user.role };
   }
 
@@ -143,8 +157,18 @@ export class FinanceController {
   }
 
   // ============================================================================
-  // 2. FEE STRUCTURES
+  // 2. FEE STRUCTURES & CONFIG OPTIONS
   // ============================================================================
+
+  @Get('config-options')
+  @Roles('SCHOOL_FINANCE', 'SCHOOL_ADMIN', 'STUDENT', 'TEACHER', 'SUPER_ADMIN')
+  async getConfigOptions(
+    @UserId() userId: string,
+    @Query('schoolId') schoolId?: string,
+  ) {
+    const ctx = await this.resolveSchoolId(userId, schoolId);
+    return this.financeService.getFinanceConfigOptions(ctx.schoolId);
+  }
 
   @Get('fee-structures')
   @Roles('SCHOOL_FINANCE', 'SCHOOL_ADMIN', 'STUDENT', 'TEACHER', 'SUPER_ADMIN')
@@ -154,6 +178,8 @@ export class FinanceController {
     @Query('targetScope') targetScope?: string,
     @Query('unitId') unitId?: string,
     @Query('departmentId') departmentId?: string,
+    @Query('classId') classId?: string,
+    @Query('termId') termId?: string,
     @Query('levelName') levelName?: string,
   ) {
     const ctx = await this.resolveSchoolId(userId, schoolId);
@@ -161,7 +187,10 @@ export class FinanceController {
       targetScope,
       unitId,
       departmentId,
+      classId,
+      termId,
       levelName,
+      onlyPublished: ctx.role === 'STUDENT',
     });
   }
 
@@ -175,6 +204,135 @@ export class FinanceController {
   ) {
     const ctx = await this.resolveSchoolId(userId, schoolId);
     return this.financeService.createFeeStructure(ctx.schoolId, userId, ctx.role, dto);
+  }
+
+  @Patch('fee-structures/:id')
+  @Roles('SCHOOL_FINANCE', 'SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('FEE_STRUCTURE_UPDATED', 'FeeStructure')
+  async updateFeeStructure(
+    @UserId() userId: string,
+    @Param('id') feeStructureId: string,
+    @Body() dto: UpdateFeeStructureDto,
+    @Query('schoolId') schoolId?: string,
+  ) {
+    const ctx = await this.resolveSchoolId(userId, schoolId);
+    return this.financeService.updateFeeStructure(
+      ctx.schoolId,
+      feeStructureId,
+      userId,
+      ctx.role,
+      dto,
+    );
+  }
+
+  @Patch('fee-structures/:id/approve')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('FEE_STRUCTURE_APPROVED', 'FeeStructure')
+  async approveFeeStructure(
+    @UserId() userId: string,
+    @Param('id') feeStructureId: string,
+    @Body() dto: ApproveFeeStructureDto,
+    @Query('schoolId') schoolId?: string,
+  ) {
+    const ctx = await this.resolveSchoolId(userId, schoolId);
+    return this.financeService.approveFeeStructure(
+      ctx.schoolId,
+      feeStructureId,
+      userId,
+      ctx.role,
+      dto,
+    );
+  }
+
+  @Patch('fee-structures/:id/reject')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN')
+  @AuditAction('FEE_STRUCTURE_REJECTED', 'FeeStructure')
+  async rejectFeeStructure(
+    @UserId() userId: string,
+    @Param('id') feeStructureId: string,
+    @Body() dto: RejectFeeStructureDto,
+    @Query('schoolId') schoolId?: string,
+  ) {
+    const ctx = await this.resolveSchoolId(userId, schoolId);
+    return this.financeService.rejectFeeStructure(
+      ctx.schoolId,
+      feeStructureId,
+      userId,
+      ctx.role,
+      dto,
+    );
+  }
+
+  @Get('students/invoices')
+  @Roles('SCHOOL_ADMIN', 'SCHOOL_FINANCE', 'SUPER_ADMIN')
+  async getSchoolStudentInvoices(
+    @UserId() userId: string,
+    @Query('schoolId') schoolId?: string,
+    @Query('status') status?: string,
+    @Query('feeStructureId') feeStructureId?: string,
+    @Query('classId') classId?: string,
+    @Query('paidDateFrom') paidDateFrom?: string,
+    @Query('paidDateTo') paidDateTo?: string,
+    @Query('search') search?: string,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+  ) {
+    const ctx = await this.resolveSchoolId(userId, schoolId);
+    return this.financeService.getSchoolStudentInvoices(ctx.schoolId, {
+      status,
+      feeStructureId,
+      classId,
+      paidDateFrom,
+      paidDateTo,
+      search,
+      page,
+      limit,
+    });
+  }
+
+  @Get('receipts')
+  @Roles('SCHOOL_ADMIN', 'SCHOOL_FINANCE', 'SUPER_ADMIN')
+  async getSchoolTransactionReceipts(
+    @UserId() userId: string,
+    @Query('schoolId') schoolId?: string,
+    @Query('channel') channel?: string,
+    @Query('classId') classId?: string,
+    @Query('paidDateFrom') paidDateFrom?: string,
+    @Query('paidDateTo') paidDateTo?: string,
+    @Query('search') search?: string,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+  ) {
+    const ctx = await this.resolveSchoolId(userId, schoolId);
+    return this.financeService.getSchoolTransactionReceipts(ctx.schoolId, {
+      channel,
+      classId,
+      paidDateFrom,
+      paidDateTo,
+      search,
+      page,
+      limit,
+    });
+  }
+
+  @Get('classes/:classId/payment-report')
+  @Roles('SCHOOL_ADMIN', 'SCHOOL_FINANCE', 'SUPER_ADMIN')
+  async getClassPaymentReport(
+    @UserId() userId: string,
+    @Param('classId') classId: string,
+    @Query('schoolId') schoolId?: string,
+    @Query('paymentStatus') paymentStatus?: string,
+    @Query('paidDateFrom') paidDateFrom?: string,
+    @Query('paidDateTo') paidDateTo?: string,
+    @Query('search') search?: string,
+  ) {
+    const ctx = await this.resolveSchoolId(userId, schoolId);
+    return this.financeService.getClassPaymentReport(ctx.schoolId, classId, {
+      paymentStatus,
+      paidDateFrom,
+      paidDateTo,
+      search,
+    });
   }
 
   // ============================================================================

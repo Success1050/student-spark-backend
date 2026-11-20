@@ -1,15 +1,49 @@
+function decodeBearerPayload(req: any): {
+  userId?: string;
+  role?: string;
+} | null {
+  const authHeader: string | undefined = req?.headers?.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  const token = authHeader.substring(7).trim();
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(
+      Buffer.from(parts[1], 'base64url').toString('utf8'),
+    );
+    const id = payload?.sub || payload?.id;
+    return {
+      userId: id ? String(id).trim() : undefined,
+      role: payload?.role ? String(payload.role).trim() : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Global User ID Extraction Utility
- * Extracts user ID with complete priority fallback:
- * 1. Explicit argument (passed explicitly from query or body)
- * 2. Already resolved `req.userId`
- * 3. `req.user?.id` or `req.user?.sub` (from auth guards or token verification)
- * 4. `x-user-id` HTTP request header
- * 5. Query parameter `userId` or `user_id`
- * 6. Body field `userId` or `user_id`
- * 7. `Authorization: Bearer <JWT>` header (decoding `sub` or `id`)
+ * Enforces verified JWT identity first for all non-SuperAdmin accounts so query/body/header
+ * userId parameters cannot impersonate another user.
  */
 export function extractUserId(req: any, explicit?: string): string {
+  const jwtInfo = decodeBearerPayload(req);
+  const authenticatedUserId =
+    (req?.user?.id && String(req.user.id).trim()) ||
+    (req?.user?.sub && String(req.user.sub).trim()) ||
+    jwtInfo?.userId ||
+    '';
+  const authenticatedRole = String(
+    req?.user?.role || jwtInfo?.role || '',
+  ).toUpperCase();
+
+  // Only SUPER_ADMIN is allowed to override userId via explicit query/body/header
+  if (authenticatedUserId && authenticatedRole !== 'SUPER_ADMIN') {
+    return authenticatedUserId;
+  }
+
   if (
     explicit &&
     String(explicit).trim() &&
@@ -28,8 +62,9 @@ export function extractUserId(req: any, explicit?: string): string {
     return String(req.userId).trim();
   }
 
-  if (req?.user?.id) return String(req.user.id).trim();
-  if (req?.user?.sub) return String(req.user.sub).trim();
+  if (authenticatedUserId) {
+    return authenticatedUserId;
+  }
 
   const headerUserId = req?.headers?.['x-user-id'];
   if (
@@ -56,21 +91,6 @@ export function extractUserId(req: any, explicit?: string): string {
     bodyUserId !== 'null'
   ) {
     return String(bodyUserId).trim();
-  }
-
-  const authHeader: string | undefined = req?.headers?.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7).trim();
-    try {
-      const parts = token.split('.');
-      if (parts.length === 3) {
-        const payload = JSON.parse(
-          Buffer.from(parts[1], 'base64').toString('utf8'),
-        );
-        if (payload?.sub) return String(payload.sub).trim();
-        if (payload?.id) return String(payload.id).trim();
-      }
-    } catch {}
   }
 
   return '';

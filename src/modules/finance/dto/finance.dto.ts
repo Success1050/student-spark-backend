@@ -154,6 +154,11 @@ export class CreateFeeStructureDto {
   classId?: string;
 
   @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  classIds?: string[];
+
+  @IsOptional()
   @IsString()
   levelName?: string; // e.g. "100L", "200L", "ND 1", "JSS 1"
 
@@ -178,6 +183,10 @@ export class CreateFeeStructureDto {
   @Min(0)
   minimumPartialKobo?: number;
 
+  @IsOptional()
+  @IsIn(['PER_SESSION', 'PER_SEMESTER', 'PER_TERM', 'ONE_TIME'])
+  billingPeriod?: string;
+
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => CreateFeeItemDto)
@@ -186,6 +195,104 @@ export class CreateFeeStructureDto {
   @IsOptional()
   @IsBoolean()
   autoGenerateInvoices?: boolean;
+}
+
+export class UpdateFeeStructureDto {
+  @IsOptional()
+  @IsString()
+  title?: string;
+
+  @IsOptional()
+  @IsString()
+  code?: string;
+
+  @IsOptional()
+  @IsString()
+  sessionName?: string;
+
+  @IsOptional()
+  @IsString()
+  termId?: string;
+
+  @IsOptional()
+  @IsString()
+  termOrSemester?: string;
+
+  @IsOptional()
+  @IsIn(['WHOLE_SCHOOL', 'FACULTY', 'DEPARTMENT', 'LEVEL_OR_CLASS'])
+  targetScope?: string;
+
+  @IsOptional()
+  @IsString()
+  unitId?: string;
+
+  @IsOptional()
+  @IsString()
+  departmentId?: string;
+
+  @IsOptional()
+  @IsString()
+  classId?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  classIds?: string[];
+
+  @IsOptional()
+  @IsString()
+  levelName?: string;
+
+  @IsOptional()
+  @IsString()
+  paymentAccountId?: string;
+
+  @IsOptional()
+  @IsString()
+  dueDate?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  isMandatory?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  allowPartialPayment?: boolean;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  minimumPartialKobo?: number;
+
+  @IsOptional()
+  @IsIn(['PER_SESSION', 'PER_SEMESTER', 'PER_TERM', 'ONE_TIME'])
+  billingPeriod?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => CreateFeeItemDto)
+  items?: CreateFeeItemDto[];
+
+  @IsOptional()
+  @IsBoolean()
+  autoGenerateInvoices?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  approveAndPublish?: boolean;
+}
+
+export class ApproveFeeStructureDto {
+  @IsOptional()
+  @IsBoolean()
+  autoGenerateInvoices?: boolean;
+}
+
+export class RejectFeeStructureDto {
+  @IsNotEmpty()
+  @IsString()
+  reason: string;
 }
 
 export class RecordWalkInPaymentDto {

@@ -54,12 +54,25 @@ export class SugService {
     });
     if (!user) throw new NotFoundException('User not found.');
 
-    const schoolId =
-      explicitSchoolId ||
+    const ownSchoolId =
       user.schoolId ||
       user.studentProfile?.schoolId ||
       user.teacherProfile?.schoolId ||
       user.memberships?.[0]?.schoolId;
+
+    if (
+      user.role !== 'SUPER_ADMIN' &&
+      explicitSchoolId &&
+      ownSchoolId &&
+      explicitSchoolId !== ownSchoolId
+    ) {
+      throw new ForbiddenException(
+        'Cross-tenant access denied: You cannot access another institution.',
+      );
+    }
+
+    const schoolId =
+      user.role === 'SUPER_ADMIN' ? explicitSchoolId || ownSchoolId : ownSchoolId;
 
     if (!schoolId) {
       throw new ForbiddenException(

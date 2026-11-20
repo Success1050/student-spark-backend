@@ -93,7 +93,7 @@ async function seedDay16() {
         accountType: 'CENTRAL_BURSARY',
         isDefault: true,
         description: 'Primary institution treasury collection account for tuition and mandatory levies.',
-        paystackSubaccountCode: 'ACCT_futo_central_bursary',
+        paystackSubaccountCode: null,
       },
     });
   }

@@ -6,8 +6,8 @@ import {
 } from '@nestjs/common';
 
 /**
- * Replaces Supabase Row-Level Security (RLS) for School Multi-Tenancy.
- * Ensures School Admins, Teachers, and Students can only access their own schoolId.
+ * Enforces School Multi-Tenancy across params, query, body, and headers.
+ * Ensures School Admins, Bursars, Teachers, and Students can only access their own schoolId.
  */
 @Injectable()
 export class TenantGuard implements CanActivate {
@@ -17,13 +17,19 @@ export class TenantGuard implements CanActivate {
 
     if (user?.role === 'SUPER_ADMIN') return true;
 
-    const requestedSchoolId =
-      request.params?.schoolId ||
-      request.headers['x-school-id'] ||
-      request.body?.schoolId;
+    const candidateSchoolIds = [
+      request.params?.schoolId,
+      request.query?.schoolId,
+      request.body?.schoolId,
+      request.headers?.['x-school-id'],
+    ]
+      .map((v) => (v !== undefined && v !== null ? String(v).trim() : ''))
+      .filter((v) => v && v !== 'undefined' && v !== 'null');
 
-    if (requestedSchoolId && user?.schoolId !== requestedSchoolId) {
-      throw new ForbiddenException('Cross-tenant access denied for this school portal');
+    if (candidateSchoolIds.length > 0) {
+      if (!user?.schoolId || candidateSchoolIds.some((id) => id !== user.schoolId)) {
+        throw new ForbiddenException('Cross-tenant access denied for this school portal');
+      }
     }
 
     return true;

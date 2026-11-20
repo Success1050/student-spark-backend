@@ -37,6 +37,8 @@ export class SchoolsController {
   }
 
   @Get(':schoolId/dashboard')
+  @Roles('SCHOOL_ADMIN', 'SUPER_ADMIN', 'SCHOOL_FINANCE')
+  @UseGuards(TenantGuard, RolesGuard)
   getDashboard(@Param('schoolId') schoolId: string) {
     return this.schoolsService.getSchoolPortalDashboard(schoolId);
   }
@@ -58,6 +60,7 @@ export class SchoolsController {
   // ============================================================================
 
   @Get(':schoolId/hierarchy')
+  @UseGuards(TenantGuard)
   getHierarchy(@Param('schoolId') schoolId: string) {
     return this.schoolsService.getSchoolHierarchy(schoolId);
   }
@@ -293,6 +296,7 @@ export class SchoolsController {
     dto: {
       fullName: string;
       staffId?: string;
+      role?: string;
       email?: string;
       title?: string;
       departmentId?: string;
@@ -578,6 +582,7 @@ export class SchoolsController {
   }
 
   @Get(':schoolId/continuity-status')
+  @UseGuards(TenantGuard)
   getContinuityStatus(@Param('schoolId') schoolId: string) {
     return this.schoolsService.getContinuityStatus(schoolId);
   }

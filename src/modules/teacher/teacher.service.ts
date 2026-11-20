@@ -841,6 +841,129 @@ export class TeacherService {
     const thresholdPercent = classSubjects[0]?.minAttendancePercent ?? 75;
     const examEligible = attendancePercent >= thresholdPercent;
 
+    // Scoped student fee history & transaction receipts (strictly limited to School Admin / Super Admin and this student's schoolId)
+    let financeHistory: {
+      termSummary: {
+        totalInvoicedKobo: number;
+        totalPaidKobo: number;
+        balanceKobo: number;
+        isCleared: boolean;
+        receiptsCount: number;
+      };
+      termInvoices: any[];
+      termReceipts: any[];
+      allReceipts: any[];
+    } | null = null;
+
+    if (isAdmin) {
+      const studentInvoices = await this.prisma.studentInvoice.findMany({
+        where: {
+          schoolId: profile.schoolId,
+          studentId: profile.userId,
+        },
+        include: {
+          feeStructure: {
+            include: {
+              class: { select: { id: true, name: true } },
+              term: { select: { id: true, name: true } },
+              feeItems: { orderBy: { sortOrder: 'asc' } },
+            },
+          },
+          payments: {
+            where: { status: 'VERIFIED' },
+            orderBy: { paidAt: 'desc' },
+            include: {
+              receipt: true,
+              recordedBy: { select: { id: true, fullName: true, role: true } },
+            },
+          },
+          receipts: {
+            orderBy: { issuedAt: 'desc' },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      const matchesSelectedTermAndClass = (inv: (typeof studentInvoices)[number]) => {
+        const fee = inv.feeStructure;
+        const termMatch = !selectedTerm
+          ? true
+          : fee.termId
+            ? fee.termId === selectedTerm.id
+            : !fee.termOrSemester ||
+              fee.termOrSemester.trim().toLowerCase() ===
+                selectedTerm.name.trim().toLowerCase();
+        const classMatch = !profile.classId || !fee.classId || fee.classId === profile.classId;
+        return termMatch && classMatch;
+      };
+
+      const termInvoicesRaw = studentInvoices.filter(matchesSelectedTermAndClass);
+      const mapInvoice = (inv: (typeof studentInvoices)[number]) => ({
+        id: inv.id,
+        invoiceNumber: inv.invoiceNumber,
+        qrClearanceToken: inv.qrClearanceToken,
+        status: inv.status,
+        totalAmountKobo: inv.totalAmountKobo,
+        paidAmountKobo: inv.paidAmountKobo,
+        balanceAmountKobo: inv.balanceAmountKobo,
+        clearedAt: inv.clearedAt ? inv.clearedAt.toISOString() : null,
+        feeTitle: inv.feeStructure.title,
+        sessionName: inv.feeStructure.sessionName,
+        termOrSemester: inv.feeStructure.term?.name || inv.feeStructure.termOrSemester || null,
+        className: inv.feeStructure.class?.name || profile.schoolClass?.name || 'General',
+        feeItems: inv.feeStructure.feeItems.map((fi) => ({
+          id: fi.id,
+          name: fi.name,
+          amountKobo: fi.amountKobo,
+        })),
+        paymentsCount: inv.payments.length,
+      });
+
+      const extractReceipts = (list: typeof studentInvoices) =>
+        list
+          .flatMap((inv) =>
+            inv.payments.map((pay) => ({
+              id: pay.receipt?.id || pay.id,
+              receiptNumber: pay.receipt?.receiptNumber || pay.receiptNumber || 'ISSUED',
+              qrToken: pay.receipt?.qrToken || pay.qrReceiptToken || inv.qrClearanceToken,
+              amountKobo: pay.amountKobo,
+              channel: pay.channel,
+              reference: pay.paystackReference || pay.reference,
+              paidAt: (pay.paidAt || pay.createdAt).toISOString(),
+              issuedAt: (pay.receipt?.issuedAt || pay.paidAt || pay.createdAt).toISOString(),
+              recordedByName: pay.recordedBy?.fullName || 'Self-Service Paystack',
+              invoiceNumber: inv.invoiceNumber,
+              feeTitle: inv.feeStructure.title,
+              sessionName: inv.feeStructure.sessionName,
+              termOrSemester:
+                inv.feeStructure.term?.name || inv.feeStructure.termOrSemester || null,
+              className: inv.feeStructure.class?.name || profile.schoolClass?.name || 'General',
+            })),
+          )
+          .sort((a, b) => new Date(b.issuedAt).getTime() - new Date(a.issuedAt).getTime());
+
+      const termInvoices = termInvoicesRaw.map(mapInvoice);
+      const termReceipts = extractReceipts(termInvoicesRaw);
+      const allReceipts = extractReceipts(studentInvoices);
+
+      const totalInvoicedKobo = termInvoices.reduce((s, i) => s + i.totalAmountKobo, 0);
+      const totalPaidKobo = termInvoices.reduce((s, i) => s + i.paidAmountKobo, 0);
+      const balanceKobo = termInvoices.reduce((s, i) => s + i.balanceAmountKobo, 0);
+
+      financeHistory = {
+        termSummary: {
+          totalInvoicedKobo,
+          totalPaidKobo,
+          balanceKobo,
+          isCleared: termInvoices.length > 0 && balanceKobo <= 0,
+          receiptsCount: termReceipts.length,
+        },
+        termInvoices,
+        termReceipts,
+        allReceipts,
+      };
+    }
+
     return {
       school: {
         id: profile.school.id,
@@ -957,6 +1080,7 @@ export class TeacherService {
         ratedCount: ratedTraitsCount,
         totalTraitsCount,
       },
+      finance: financeHistory,
     };
   }
 
